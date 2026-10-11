@@ -15,6 +15,22 @@ async function getFF(onLog) {
   if (!ff.__hooked) { ff.on('log', ({ message }) => ff.__onLog && ff.__onLog(message)); ff.__hooked = true; }
   return ff;
 }
+// Fast trim (stream copy, no re-encode) so cloud AI only receives the selected range.
+export async function trimClip(blob, name, tin, tout) {
+  const f = await getFF();
+  const ext = extOf(name || '', blob.type);
+  const src = `trim_in.${ext}`, dst = `trim_out.${ext === 'mov' ? 'mov' : 'mp4'}`;
+  await f.writeFile(src, new Uint8Array(await blob.arrayBuffer()));
+  try {
+    const code = await f.exec(['-ss', String(tin), '-i', src, '-t', String(Math.max(0.1, tout - tin)), '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', dst]);
+    if (code !== 0) throw new Error('trim failed');
+    const data = await f.readFile(dst);
+    return new Blob([data], { type: dst.endsWith('mov') ? 'video/quicktime' : 'video/mp4' });
+  } finally {
+    try { await f.deleteFile(src); } catch {}
+    try { await f.deleteFile(dst); } catch {}
+  }
+}
 export function cancelFF() { if (ff) { try { ff.terminate(); } catch {} ff = null; } }
 
 async function captionPng(cap, W, H) {

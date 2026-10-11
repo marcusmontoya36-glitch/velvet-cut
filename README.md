@@ -76,24 +76,27 @@ Nothing is sent unless you press a hook button and confirm the upload dialog.
 - Live dictate needs a microphone and works best in a quiet room.
 - No multi-track (one video track + one text track), no transitions, no audio mixing / music track yet.
 
-## Wiring real AI enhance (next steps)
-`hooks.js` → `runHook(op, input, cfg)` gets `op` (`enhance` | `upscale` | `polish` | `img2vid`) and
-`input = { blob, name, in, out }`, and must return a video `Blob`; the result is imported as a new clip.
+## AI enhance (fal.ai — wired)
+**Turn it on:** get a key at [fal.ai/dashboard/keys](https://fal.ai/dashboard/keys) → ⚙️ Settings → Provider **fal.ai** →
+paste the key → Save → select a clip → tap **Enhance**. The key is stored only in that browser's localStorage
+(never in this repo). Usage is billed to your own fal account.
 
-1. **Own endpoint (already wired):** Settings → “My own endpoint”. The app POSTs multipart
-   `file, op, in, out` with `Authorization: Bearer <token>` and expects video bytes back. Point it at a home
-   GPU box (e.g. a small FastAPI wrapper around ComfyUI, Real-ESRGAN / Video2X for upscale, RIFE for
-   frame interpolation, or an open-weights image-to-video model). The server must send CORS headers. Self-hosting is the
-   most reliable path for explicit material — most hosted APIs reject it.
-2. **fal.ai / Replicate / Runway:** fill in `adapters.fal` / `adapters.replicate` / `adapters.runway` in
-   `hooks.js`: upload the blob (provider storage API), submit the job for the model you choose, poll until
-   done, `fetch()` the output URL, return `await res.blob()`. Trim first (`in`/`out`) to cut upload size —
-   e.g. run a quick ffmpeg.wasm `-ss/-t -c copy` before upload. Check each provider's content policy first;
-   most hosted video models refuse sexual content and may ban accounts for it.
-3. Calling hosted APIs straight from the browser exposes the key to that browser only (it is the user's own
-   key on their own device), but a tiny proxy is better if you share the app.
-4. Better local AI later: Whisper (transformers.js / whisper.cpp wasm) for true file-based auto captions,
-   MediaPipe for smart reframe (landscape → vertical crop that follows the people in the shot).
+| Button | fal.ai model | Settings |
+|---|---|---|
+| 🪄 Enhance clip | `fal-ai/topaz/upscale/video` | Artemis HQ, 1× (denoise + sharpen, same size) |
+| ⬆ Upscale | `fal-ai/topaz/upscale/video` → fallback `fal-ai/video-upscaler` | Proteus 2× → Real-ESRGAN 2× |
+| ✨ AI polish | `fal-ai/topaz/upscale/video` | Artemis HQ 2× (no generative re-grade; use Auto color for color) |
+| 🖼→🎞 Image → video | — | not wired on fal (hosted i2v models block explicit content); use your own endpoint |
+
+Flow (`hooks.js` → `falAdapter`): trim the selected in/out with ffmpeg.wasm (stream copy) → upload to fal storage
+(`POST rest.fal.ai/storage/upload/initiate` + `PUT`) → `POST queue.fal.run/<model>` → poll `status_url` until
+`COMPLETED` → fetch `response_url` → download `video.url` → imported as a new clip. 401/403/422 come back as clear
+messages (bad key, no credits, content-policy refusal). Hosted providers may refuse explicit footage.
+
+**Own endpoint (also wired):** Settings → “My own endpoint”. The app POSTs multipart `file, op, in, out` with
+`Authorization: Bearer <token>` and expects video bytes back (CORS required). Use this for a home GPU box
+(ComfyUI, Real-ESRGAN/Video2X, RIFE, open-weights image-to-video) — the reliable path for explicit material
+and the only path for Image → video. Replicate/Runway remain stubs in `hooks.js`.
 
 ## Files
 ```

@@ -514,7 +514,8 @@ async function hook(op) {
   const cfg = loadAI(); const h = HOOKS[op];
   if (!providerReady(cfg)) {
     return modal(`${h.title} — connect later`, html(`<p>${h.desc}</p><p>No AI provider is connected yet, so this is a placeholder. The editor works fully without it.</p>
-      <p class="muted small">To enable: ⚙️ Settings → pick a provider (fal.ai, Replicate, Runway, or <b>your own endpoint</b> such as a home GPU box) and paste a key. Keys stay in this browser’s localStorage. Many hosted providers refuse explicit content — a self-hosted endpoint avoids that.</p>`),
+      <p><b>Turn it on (2 min):</b> get a key at <b>fal.ai/dashboard/keys</b> → ⚙️ Settings → Provider: fal.ai → paste the key → Save → tap Enhance.</p>
+      <p class="muted small">fal.ai bills per use from your own fal account (add credits there). Keys stay in this browser’s localStorage only. Hosted providers may refuse explicit footage — “My own endpoint” (home GPU box) avoids that.</p>`),
       [{ label: 'Later' }, { label: 'Open Settings', cls: 'primary', onClick: () => { setTimeout(openSettings, 50); } }]);
   }
   let input;
@@ -523,17 +524,19 @@ async function hook(op) {
     input = { blob: f, name: f.name };
   } else {
     const c = selClip(); if (!c) return toast('Select a clip first');
-    const m = S.media.get(c.mediaId); input = { blob: m.blob, name: m.name, in: c.in, out: c.out };
+    const m = S.media.get(c.mediaId); input = { blob: m.blob, name: m.name, in: c.in, out: c.out, dur: c.dur };
   }
   const where = cfg.provider === 'custom' ? cfg.customUrl : cfg.provider;
   const ok = await modal('Send off this device?', html(`<p>This uploads <b>${esc(input.name)}</b> (${(input.blob.size / 1048576).toFixed(1)} MB) to <b>${esc(where)}</b> for “${h.title}”. Only continue if you’re OK with that provider seeing it.</p>`), [{ label: 'Cancel', value: false }, { label: 'Upload', cls: 'primary', value: true }]);
   if (!ok) return;
   try {
-    const out = await runHook(op, input, cfg, (s) => toast(s, 20000));
+    const out = await runHook(op, input, cfg, (s) => toast(s, 60000));
+    toast(`${h.title} done — added to the timeline`, 4000);
     const file = new File([out], `${h.title.replace(/\W+/g, '-')}-${Date.now()}.mp4`, { type: out.type || 'video/mp4' });
     await importFiles([file]);
   } catch (e) {
-    modal(e.notWired ? 'Adapter not wired yet' : 'AI hook failed', html(`<p>${esc(e.message)}</p>`));
+    toast('', 1);
+    modal(e.notWired ? 'Not available with this provider' : e.policy ? 'Blocked by provider' : 'AI enhance failed', html(`<p>${esc(e.message)}</p>`));
   }
 }
 function pickFile(accept) {
@@ -632,11 +635,12 @@ function openSettings() {
     <label>Provider<select id="sProv">
       <option value="none">None — local tools only</option>
       <option value="custom">My own endpoint (self-hosted GPU / ComfyUI)</option>
-      <option value="fal">fal.ai</option><option value="replicate">Replicate</option><option value="runway">Runway</option>
+      <option value="fal">fal.ai (Enhance / Upscale / Polish)</option><option value="replicate">Replicate</option><option value="runway">Runway</option>
     </select></label>
     <div class="keyrow"><label>Custom endpoint URL<input id="sUrl" placeholder="https://my-gpu.local:8000/enhance" value="${esc(c.customUrl)}"></label></div>
     <label>Custom endpoint token<input id="sTok" type="password" value="${esc(c.customToken)}"></label>
-    <label>fal.ai key<input id="sFal" type="password" value="${esc(c.fal)}"></label>
+    <label>fal.ai key<input id="sFal" type="password" autocomplete="off" placeholder="paste key from fal.ai/dashboard/keys" value="${esc(c.fal)}"></label>
+    <p class="muted small"><b>fal.ai:</b> get a key at <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener">fal.ai/dashboard/keys</a> — paste here — pick “fal.ai” above — Save — select a clip and tap Enhance. Enhance = Topaz Artemis HQ · Upscale = Topaz Proteus 2× (Real-ESRGAN fallback) · AI polish = Artemis HQ 2×. Billed to your fal account.</p>
     <label>Replicate token<input id="sRep" type="password" value="${esc(c.replicate)}"></label>
     <label>Runway key<input id="sRun" type="password" value="${esc(c.runway)}"></label>
     <p class="muted small">Keys are stored only in this browser (localStorage) and are only used when you press an Enhance button and confirm the upload.</p>

@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0b10">
+<meta name="robots" content="noindex, nofollow">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Velvet Cut">
+<title>Velvet Cut — private video editor</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<!-- 18+ gate -->
+<div id="ageGate" class="modal show" role="dialog" aria-modal="true">
+  <div class="card gate">
+    <div class="logo big">VC</div>
+    <h1>Adults only (18+)</h1>
+    <p>This is a private editor for adult video. Files stay on this device unless <b>you</b> trigger an optional cloud AI action.</p>
+    <label class="chk"><input type="checkbox" id="gateAge"> I am 18 or older.</label>
+    <label class="chk"><input type="checkbox" id="gateConsent"> All people in content I edit are consenting adults (18+) and I have the right to use it.</label>
+    <div class="row">
+      <button id="gateEnter" class="primary" disabled>Enter</button>
+      <a class="btn ghost" href="https://www.google.com">Leave</a>
+    </div>
+  </div>
+</div>
+
+<header class="top">
+  <div class="brand"><div class="logo">VC</div><span>Velvet&nbsp;Cut</span></div>
+  <input id="projName" class="projname" value="Untitled project" aria-label="Project name">
+  <div class="topbtns">
+    <button id="btnProjects" title="Projects">📁<span class="lbl"> Projects</span></button>
+    <button id="btnSave" title="Save project">💾<span class="lbl"> Save</span></button>
+    <button id="btnPrivacy" title="Privacy blur (Esc)">🙈</button>
+    <button id="btnSettings" title="Settings">⚙️</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="viewer">
+    <div id="stageWrap" class="stagewrap">
+      <div id="stage" class="stage">
+        <video id="player" playsinline webkit-playsinline preload="auto"></video>
+        <div id="capLayer" class="caplayer"></div>
+        <div id="dropHint" class="drophint">
+          <div>Drop videos here<br><small>mp4 · mov · webm — stays on this device</small></div>
+          <button id="btnImport2" class="primary">＋ Import videos</button>
+        </div>
+      </div>
+    </div>
+    <div class="transport">
+      <button id="btnPlay" class="round" title="Play/Pause (Space)">▶</button>
+      <span id="tc" class="tc">0:00.0 / 0:00.0</span>
+      <input id="scrub" type="range" min="0" max="0" step="0.01" value="0" aria-label="Playhead">
+      <button id="btnMuteAll" title="Mute preview">🔊</button>
+    </div>
+  </section>
+
+  <section class="side">
+    <nav class="tabs">
+      <button data-tab="clip" class="on">Clip</button>
+      <button data-tab="text">Text</button>
+      <button data-tab="color">Color</button>
+      <button data-tab="ai">AI ✨</button>
+      <button data-tab="export">Export</button>
+    </nav>
+
+    <div class="panel on" id="tab-clip">
+      <div id="clipEmpty" class="muted">Import videos, then tap a clip on the timeline.</div>
+      <div id="clipInspector" hidden>
+        <div class="field"><b id="ciName">clip</b> <span id="ciInfo" class="muted"></span></div>
+        <div class="grid2">
+          <label>In (s)<input id="ciIn" type="number" step="0.1" min="0"></label>
+          <label>Out (s)<input id="ciOut" type="number" step="0.1" min="0"></label>
+        </div>
+        <div class="btnrow">
+          <button id="ciSetIn">⇤ In @ playhead</button>
+          <button id="ciSetOut">Out @ playhead ⇥</button>
+        </div>
+        <div class="btnrow">
+          <button id="ciSplit">✂ Split @ playhead</button>
+          <button id="ciMute">🔇 Mute</button>
+          <button id="ciDup">⧉ Duplicate</button>
+        </div>
+        <div class="btnrow">
+          <button id="ciLeft">◀ Move</button>
+          <button id="ciRight">Move ▶</button>
+          <button id="ciDel" class="danger">🗑 Delete</button>
+        </div>
+      </div>
+      <hr>
+      <button id="btnImport" class="primary wide">＋ Import videos</button>
+      <input id="fileInput" type="file" accept="video/*,.mp4,.mov,.m4v,.webm" multiple hidden>
+    </div>
+
+    <div class="panel" id="tab-text">
+      <div class="btnrow">
+        <button id="capAdd" class="primary">＋ Text @ playhead</button>
+        <button id="capSrt">⬇ SRT</button>
+        <label class="btn">⬆ Import SRT<input id="srtInput" type="file" accept=".srt,.vtt,text/plain" hidden></label>
+      </div>
+      <div id="capEmpty" class="muted">No text yet. Select a caption on the timeline or the preview (drag it to move).</div>
+      <div id="capInspector" hidden>
+        <label>Text<textarea id="cpText" rows="2"></textarea></label>
+        <div class="grid2">
+          <label>Start (s)<input id="cpStart" type="number" step="0.1" min="0"></label>
+          <label>End (s)<input id="cpEnd" type="number" step="0.1" min="0"></label>
+        </div>
+        <label>Size <span id="cpSizeV"></span><input id="cpSize" type="range" min="2" max="15" step="0.5"></label>
+        <label>X <input id="cpX" type="range" min="0" max="1" step="0.01"></label>
+        <label>Y <input id="cpY" type="range" min="0" max="1" step="0.01"></label>
+        <div class="grid2">
+          <label>Color<input id="cpColor" type="color"></label>
+          <label class="chk"><input id="cpBox" type="checkbox"> Background box</label>
+        </div>
+        <button id="cpDel" class="danger wide">🗑 Delete text</button>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-color">
+      <label>Brightness <span id="cbV"></span><input id="colB" type="range" min="-0.5" max="0.5" step="0.01" value="0"></label>
+      <label>Contrast <span id="ccV"></span><input id="colC" type="range" min="0.5" max="2" step="0.01" value="1"></label>
+      <label>Saturation <span id="csV"></span><input id="colS" type="range" min="0" max="2.5" step="0.01" value="1"></label>
+      <label>Warmth <span id="cwV"></span><input id="colW" type="range" min="-1" max="1" step="0.05" value="0"></label>
+      <div class="btnrow">
+        <button id="colReset">Reset</button>
+        <button id="colAuto">✨ Auto color (local)</button>
+      </div>
+      <p class="muted small">Color applies to the whole project, in preview and export.</p>
+    </div>
+
+    <div class="panel" id="tab-ai">
+      <h3>Suggest cuts <span class="pill">local</span></h3>
+      <p class="muted small">Finds silence, low-motion and black stretches with WebAudio + frame sampling. Nothing leaves the device.</p>
+      <div class="grid2">
+        <label>Silence below (dB)<input id="aiDb" type="number" value="-42" step="1"></label>
+        <label>Min length (s)<input id="aiMin" type="number" value="1.5" step="0.5" min="0.3"></label>
+      </div>
+      <div class="grid2">
+        <label>Mode<select id="aiMode">
+          <option value="either">Silence OR still</option>
+          <option value="both">Silence AND still</option>
+          <option value="silence">Silence only</option>
+          <option value="motion">Low motion only</option>
+        </select></label>
+        <label>Scope<select id="aiScope"><option value="sel">Selected clip</option><option value="all">All clips</option></select></label>
+      </div>
+      <button id="aiAnalyze" class="primary wide">🔍 Analyze</button>
+      <div id="aiProgress" class="muted small"></div>
+      <div id="aiResults"></div>
+
+      <h3>Auto caption</h3>
+      <div class="btnrow">
+        <button id="acLive">🎙 Live dictate</button>
+        <button id="acPaste">📋 Paste transcript</button>
+      </div>
+      <p id="acNote" class="muted small"></p>
+
+      <h3>Enhance <span class="pill">optional cloud</span></h3>
+      <div class="btnrow">
+        <button data-hook="enhance">🪄 Enhance clip</button>
+        <button data-hook="upscale">⬆ Upscale</button>
+        <button data-hook="polish">✨ AI polish</button>
+        <button data-hook="img2vid">🖼→🎞 Image → video</button>
+      </div>
+      <p class="muted small">Cloud hooks are off until you add a key in ⚙️ Settings. The core editor never needs them.</p>
+    </div>
+
+    <div class="panel" id="tab-export">
+      <div class="grid2">
+        <label>Resolution<select id="exRes">
+          <option value="720">720p (recommended)</option>
+          <option value="1080">1080p (slow)</option>
+          <option value="480">480p (fast)</option>
+          <option value="src">Source size</option>
+        </select></label>
+        <label>Quality<select id="exQ">
+          <option value="23">Good</option><option value="19">High</option><option value="28">Small file</option>
+        </select></label>
+      </div>
+      <label class="chk"><input id="exCaps" type="checkbox" checked> Burn in text</label>
+      <button id="exFf" class="primary wide">⬇ Export MP4 (ffmpeg.wasm)</button>
+      <button id="exRt" class="wide">⏺ Real-time export (light, iPhone-friendly)</button>
+      <button id="exCancel" class="danger wide" hidden>Cancel</button>
+      <div class="progress"><div id="exBar"></div></div>
+      <div id="exStatus" class="muted small"></div>
+      <a id="exLink" class="btn primary wide" hidden download>Save video</a>
+      <p class="muted small">ffmpeg.wasm downloads a ~31&nbsp;MB engine once and encodes on-device (CPU-heavy; keep the tab open). Real-time export plays the timeline once and records it.</p>
+    </div>
+  </section>
+
+  <section class="timelinewrap">
+    <div class="tlbar">
+      <span class="muted small" id="tlInfo">0 clips</span>
+      <label class="small zoom">Zoom <input id="zoom" type="range" min="4" max="120" value="30"></label>
+    </div>
+    <div id="timeline" class="timeline">
+      <div id="tlInner" class="tlinner">
+        <div id="ruler" class="ruler"></div>
+        <div id="lane" class="lane"></div>
+        <div id="capLane" class="lane caps"></div>
+        <div id="playhead" class="playhead"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- generic modal -->
+<div id="modal" class="modal" role="dialog" aria-modal="true">
+  <div class="card">
+    <h2 id="mTitle"></h2>
+    <div id="mBody"></div>
+    <div class="row right" id="mBtns"></div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+<div id="privacy" class="privacy"><div>Hidden — tap to return</div></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

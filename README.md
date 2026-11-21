@@ -30,8 +30,9 @@ Videos you import on the phone stay in that phone's Safari storage.
 
 Tap **⚡ Auto Edit**, pick one or more videos, and the app edits them on the device:
 
-1. **Analyze** each video at low resolution (160 px frames, about 3 samples/s, fewer on long clips) by seeking a hidden `<video>`.
-   The whole file is never loaded into memory, so long clips are fine.
+1. **Analyze** each video at low resolution (120 px frames, 2 samples/s, fewer on long clips). It plays a muted hidden `<video>`
+   at 8× speed and grabs frames with `requestVideoFrameCallback`, because per-frame seeking is very slow on iOS. If the
+   browser stalls, it falls back to short-timeout seeks, and a watchdog makes sure analysis never hangs. The whole file is never loaded into memory.
 2. **Cut bad shots.** Parts that are blurry (low Laplacian variance compared with the sharpest footage), too dark, blown out,
    shaky (erratic global motion between frames), frozen/static, too short, or near-duplicates get cut. Every cut is listed
    with its reasons and a thumbnail, and **↩ Restore** puts it back. Sensitivity can be Loose, Normal or Strict.
@@ -51,7 +52,12 @@ Tap **⚡ Auto Edit**, pick one or more videos, and the app edits them on the de
 After an Auto Edit, the normal timeline tools still work: trim, split, reorder, delete, captions, undo.
 Changing a setting re-plans instantly because the analysis is cached.
 
-**Limits:** analysis runs at about 1 to 2× real time on a desktop and is usually slower on a phone. Export speed is
+**Import is instant:** it only creates an object URL and reads metadata. The poster frame (from a `#t=` media fragment, no seeking),
+the capture date and the save to IndexedDB run in the background. `.mov` blobs are re-typed `video/mp4` with `slice()` (no copy),
+because WebKit can refuse `video/quicktime` blob URLs. ffmpeg.wasm loads only when you export. The 31 MB core is
+downloaded once with a progress readout into its own cache bucket (`vc-core-v1`), which app updates don't wipe.
+
+**Limits:** analysis takes about 1.5 s for a 10 s clip on a desktop (8× playback) and depends on the phone. Export speed is
 about 0.5 to 1× real time at 720p on a desktop. On iPhone, keep exports to roughly 5 minutes at 720p (or use 480p). The
 encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color
 and camera moves but not crossfades, denoise or sharpen.

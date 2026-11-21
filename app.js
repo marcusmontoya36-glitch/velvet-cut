@@ -1,7 +1,7 @@
 import * as DB from './db.js';
 import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss } from './render.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
-import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings } from './autoedit.js';
+import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis } from './autoedit.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
 import { loadAI, saveAI, HOOKS, providerReady, runHook } from './hooks.js';
 
@@ -78,47 +78,96 @@ async function saveProject(silent) {
 }
 
 // ---------------- media import ----------------
+// Import is instant: object URL + metadata only. The poster frame, capture time and saving to IndexedDB
+// happen in the background, and nothing here touches ffmpeg or seeks through the video.
+function waitEv(el, ev, ms) {
+  return new Promise((res, rej) => {
+    const ok = () => { done(); res(true); }, bad = () => { done(); rej(new Error('Media error ' + (el.error?.code || ''))); };
+    const to = setTimeout(() => { done(); rej(new Error('timeout:' + ev)); }, ms);
+    const done = () => { clearTimeout(to); el.removeEventListener(ev, ok); el.removeEventListener('error', bad); };
+    el.addEventListener(ev, ok); el.addEventListener('error', bad);
+  });
+}
 async function probe(url) {
   const v = document.createElement('video');
-  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
-  await once(v, 'loadedmetadata');
-  if (!isFinite(v.duration)) { // MediaRecorder webm: force duration
-    v.currentTime = 1e7; await once(v, 'seeked'); v.currentTime = 0; await once(v, 'seeked');
-  }
-  const info = { duration: v.duration, w: v.videoWidth, h: v.videoHeight };
-  v.currentTime = Math.min(0.5, info.duration / 3);
-  try { await Promise.race([once(v, 'seeked'), new Promise((_, r) => setTimeout(() => r(), 4000))]); } catch {}
-  const th = document.createElement('canvas');
-  const tw = 120; th.width = tw; th.height = Math.round(tw * (info.h || 9) / (info.w || 16)) || 68;
-  try { th.getContext('2d').drawImage(v, 0, 0, th.width, th.height); info.thumb = th.toDataURL('image/jpeg', 0.6); } catch { info.thumb = ''; }
-  v.removeAttribute('src'); v.load();
-  return info;
+  v.muted = true; v.playsInline = true; v.preload = 'metadata';
+  try {
+    const p = waitEv(v, 'loadedmetadata', 12000); v.src = url; await p;
+    let duration = v.duration;
+    if (!isFinite(duration)) { // MediaRecorder webm: force duration
+      try { const q = waitEv(v, 'seeked', 3000); v.currentTime = 1e7; await q; } catch {}
+      duration = isFinite(v.duration) ? v.duration : v.currentTime;
+    }
+    return { duration, w: v.videoWidth, h: v.videoHeight };
+  } finally { v.removeAttribute('src'); v.load(); }
 }
-async function importFiles(files, { add = true } = {}) {
-  files = [...files].filter(f => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name));
-  if (!files.length) return toast('No video files found');
+// Poster frame without seeking: a media fragment (#t=) makes Safari render that frame; fallback = muted play.
+async function posterFrame(url) {
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto';
+  v.style.cssText = 'position:fixed;left:0;bottom:0;width:32px;height:18px;opacity:0.01;pointer-events:none;z-index:-1';
+  document.body.appendChild(v);
+  try {
+    const p = waitEv(v, 'loadeddata', 2500); v.src = url + '#t=0.15';
+    try { await p; } catch {
+      try { const pp = v.play(); await Promise.race([pp, new Promise((_, r) => setTimeout(() => r(new Error('t')), 2000))]); await new Promise(r => setTimeout(r, 120)); v.pause(); } catch {}
+    }
+    if (v.readyState < 2 || !v.videoWidth) return '';
+    const th = document.createElement('canvas');
+    th.width = 120; th.height = Math.round(120 * v.videoHeight / v.videoWidth) || 68;
+    th.getContext('2d').drawImage(v, 0, 0, th.width, th.height);
+    return th.toDataURL('image/jpeg', 0.6);
+  } catch { return ''; }
+  finally { v.removeAttribute('src'); v.load(); v.remove(); }
+}
+// iOS/WebKit can refuse a blob typed video/quicktime; the same bytes typed video/mp4 play fine (no copy: slice()).
+const playableBlob = (f, name = f.name) => (/\.mov$/i.test(name || '') || f.type === 'video/quicktime') ? f.slice(0, f.size, 'video/mp4') : f;
+async function importFiles(files, { add = true, onProgress, deferFinish = false } = {}) {
+  files = [...files].filter(f => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv|hevc)$/i.test(f.name));
+  if (!files.length) { toast('No video files found'); return []; }
   DB.persist();
   const added = [];
-  for (const f of files) {
-    toast(`Importing ${f.name}…`, 10000);
-    const id = uid(), url = URL.createObjectURL(f);
-    let info;
+  const t0 = performance.now();
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const msg = `Importing ${files.length > 1 ? `${i + 1} of ${files.length}` : f.name}…`;
+    onProgress ? onProgress(msg) : toast(msg, 10000);
+    const id = uid();
+    let url = URL.createObjectURL(playableBlob(f)), info;
     try { info = await probe(url); }
-    catch (e) { URL.revokeObjectURL(url); toast(`Can't play ${f.name} in this browser (codec?). Try converting to H.264 MP4.`, 6000); continue; }
-    const capture = (await readCaptureTime(f)) || f.lastModified || null;
-    const rec = { id, blob: f, name: f.name, type: f.type, capture, order: Date.now() + added.length, ...info };
+    catch (e) {
+      URL.revokeObjectURL(url); url = URL.createObjectURL(f); // retry with the original type
+      try { info = await probe(url); } catch { URL.revokeObjectURL(url); toast(`Can't play ${f.name} in this browser (codec?). Try converting to H.264 MP4.`, 6000); continue; }
+    }
+    if (!info.w || !info.h) { URL.revokeObjectURL(url); toast(`${f.name}: this browser can't decode its video (HEVC/H.265 needs Safari or a recent Chrome). Try “Most Compatible” in iPhone Camera settings or convert to H.264.`, 8000); continue; }
+    const rec = { id, blob: f, name: f.name, type: f.type, capture: null, order: Date.now() + i, thumb: '', ...info };
     S.media.set(id, { ...rec, url });
-    try { await DB.putMedia(rec); } catch (e) { toast('Storage full — clip works now but won’t be saved: ' + e.message, 6000); }
     added.push({ id: uid(), mediaId: id, name: f.name.replace(/\.\w+$/, ''), in: 0, out: r2(info.duration), dur: info.duration, w: info.w, h: info.h, muted: false });
   }
+  console.info(`[import] ${added.length} file(s) ready in ${Math.round(performance.now() - t0)} ms`);
+  window.__lastImportMs = performance.now() - t0;
   if (!added.length) return [];
+  if (!deferFinish) finishImport(added.map(c => c.mediaId));
   if (!add) return added;
   mutate(() => { S.proj.clips.push(...added); S.sel = added[0].id; });
   toast(`Added ${added.length} clip${added.length > 1 ? 's' : ''}`);
   if (S.idx < 0) seek(S.t);
   return added;
 }
-
+// background work after import: capture time, poster frame, save the original file in IndexedDB
+let finishQ = Promise.resolve();
+function finishImport(ids) {
+  finishQ = finishQ.then(async () => {
+    for (const id of ids) {
+      const m = S.media.get(id); if (!m) continue;
+      try { if (m.capture == null) m.capture = (await readCaptureTime(m.blob)) || m.blob.lastModified || null; } catch {}
+      if (!m.thumb) { try { m.thumb = await posterFrame(m.url); if (m.thumb) renderTimeline(); } catch {} }
+      const { url, ...rec } = m;
+      try { await DB.putMedia(rec); } catch (e) { toast('Couldn’t save this clip on the device (storage full or Private Browsing) — it works until you close the tab.', 6000); }
+    }
+  });
+  return finishQ;
+}
 // ---------------- preview playback ----------------
 const player = $('#player');
 async function loadIdx(idx, local, play) {
@@ -128,12 +177,12 @@ async function loadIdx(idx, local, play) {
   try {
     if (player.dataset.mid !== c.mediaId) {
       player.dataset.mid = c.mediaId; player.src = m.url;
-      await once(player, 'loadedmetadata');
+      await waitEv(player, 'loadedmetadata', 10000).catch(() => {});
     }
     S.idx = idx;
     player.muted = S.mutedAll || c.muted;
     const target = c.in + local;
-    if (Math.abs(player.currentTime - target) > 0.03) { player.currentTime = target; await once(player, 'seeked').catch(() => {}); }
+    if (Math.abs(player.currentTime - target) > 0.03) { player.currentTime = target; await waitEv(player, 'seeked', 3000).catch(() => {}); }
     if (play) await player.play().catch(e => { S.playing = false; updatePlayBtn(); });
   } finally { S.switching = false; applyLook(); }
 }
@@ -619,10 +668,10 @@ function writeAutoUI(st) {
 function bindAuto() {
   writeAutoUI(loadAutoSettings());
   const fi = $('#autoFile');
-  const pick = () => { if (S.autoJob) return toast('Auto Edit is already running'); fi.click(); };
+  const pick = () => { if (S.autoJob) return toast('Auto Edit is already running'); unlockAnalysis(); fi.click(); };
   $('#auPick').onclick = pick; $('#btnAuto').onclick = () => { showTab('auto'); pick(); }; $('#btnAuto2').onclick = pick;
   fi.onchange = () => { const f = [...fi.files]; fi.value = ''; if (f.length) autoEdit(f); };
-  $('#auRerun').onclick = () => autoEdit(null);
+  $('#auRerun').onclick = () => { unlockAnalysis(); autoEdit(null); };
   $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
   $('#auExport').onclick = doExportAuto;
   $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
@@ -642,13 +691,14 @@ async function autoEdit(files) {
   $('#auCancel').hidden = false; $('#auPick').disabled = $('#auRerun').disabled = true; $('#auExportBox').hidden = true;
   $('#tab-auto').scrollIntoView?.({ block: 'nearest' });
   const t0 = performance.now();
+  let newMids = null;
   try {
     let mids;
     if (files) {
       auProg(0, 'Importing…');
-      const added = await importFiles(files, { add: false });
+      const added = await importFiles(files, { add: false, deferFinish: true, onProgress: (m) => auProg(0.01, m) });
       if (!added?.length) throw new Error('No playable videos were imported');
-      mids = added.map(c => c.mediaId);
+      mids = added.map(c => c.mediaId); newMids = mids;
     } else {
       mids = [...new Set([...clips(), ...(S.proj.autoCuts || [])].map(c => c.mediaId))].filter(id => S.media.has(id));
       if (!mids.length) throw new Error('No videos in this project yet — tap “Auto Edit — pick videos”.');
@@ -661,9 +711,11 @@ async function autoEdit(files) {
       const id = mids[i], m = S.media.get(id);
       if (m.capture == null) m.capture = (await readCaptureTime(m.blob)) || m.blob.lastModified || null;
       let an = S.analysis.get(id);
+      const ta = performance.now();
       if (!an) {
         an = await analyzeRange(m.url, 0, m.duration, { signal: ac.signal,
-          onTick: (f) => auProg(0.9 * (done + f * m.duration) / totalDur, `Analyzing video ${i + 1}/${mids.length} (blur, light, shake, scenes)`) });
+          onTick: (f) => auProg(0.9 * (done + f * m.duration) / totalDur, `Analyzing clip ${i + 1} of ${mids.length}…`) });
+        console.info(`[auto] analysed ${m.name} (${m.duration.toFixed(1)} s) in ${Math.round(performance.now() - ta)} ms via ${an.mode}, ${an.samples.length} samples`);
         S.analysis.set(id, an);
       }
       done += m.duration;
@@ -680,7 +732,7 @@ async function autoEdit(files) {
     if (st.camera) shots = planCamera(shots, st.camLevel);
     const newClips = shots.map((s, k) => {
       const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
-      const e = (st.color || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.3) } : null;
+      const e = (st.color || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
       return { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
         enh: e, cam: st.camera ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
     });
@@ -698,6 +750,7 @@ async function autoEdit(files) {
     console.error(e);
   } finally {
     S.autoJob = null; $('#auCancel').hidden = true; $('#auPick').disabled = $('#auRerun').disabled = false;
+    if (newMids) finishImport(newMids); // poster/capture/save after analysis so they don't compete for the decoder
     renderAuto();
   }
 }
@@ -768,7 +821,7 @@ async function openProject(id) {
   S.media.clear();
   for (const mid of new Set([...p.clips, ...(p.autoCuts || [])].map(c => c.mediaId))) {
     const rec = await DB.getMedia(mid);
-    if (rec) S.media.set(mid, { ...rec, url: URL.createObjectURL(rec.blob) });
+    if (rec) S.media.set(mid, { ...rec, url: URL.createObjectURL(playableBlob(rec.blob, rec.name)) });
   }
   S.proj = p; S.sel = p.clips[0]?.id || null; S.selCap = null; S.undo = []; S.redo = []; S.sugg = []; S.analysis.clear();
   $('#projName').value = p.name; player.dataset.mid = ''; S.t = 0; S.idx = -1;

@@ -6,8 +6,29 @@ let ff = null;
 const abs = (p) => new URL(p, location.href).href;
 const extOf = (name, type) => (name.match(/\.(\w{2,4})$/)?.[1] || (type || '').split('/')[1] || 'mp4').toLowerCase();
 
-async function getFF(onLog) {
+export const CORE_CACHE = 'vc-core-v1';
+// Download the ~31 MB wasm core once with visible progress and keep it in a dedicated Cache Storage
+// bucket that survives app updates (the service worker serves it cache-first from there).
+async function warmCore(onP) {
+  if (ff || !onP || typeof caches === 'undefined' || !navigator.serviceWorker?.controller) return;
+  const url = abs('vendor/ffmpeg/core/ffmpeg-core.wasm');
+  try {
+    const cache = await caches.open(CORE_CACHE);
+    if (await cache.match(url)) return;
+    const res = await fetch(url);
+    if (!res.ok || !res.body) return;
+    const put = cache.put(url, res.clone());
+    const total = 32.2e6; let got = 0;
+    const rd = res.body.getReader();
+    for (;;) { const { done, value } = await rd.read(); if (done) break; got += value.length; onP(Math.min(got, total), total); }
+    await put;
+  } catch (e) { console.warn('core warm-up failed', e); }
+}
+export async function preloadEngine(onP) { await warmCore(onP); }
+async function getFF(onLog, onStage) {
   if (!ff) {
+    await warmCore(onStage && ((g, t) => onStage(`Loading engine… ${(g / 1048576).toFixed(0)} of ${(t / 1048576).toFixed(0)} MB (one time)`)));
+    onStage && onStage('Starting engine…');
     ff = new FFmpeg();
     await ff.load({ coreURL: abs('vendor/ffmpeg/core/ffmpeg-core.js'), wasmURL: abs('vendor/ffmpeg/core/ffmpeg-core.wasm') });
   }
@@ -52,7 +73,7 @@ export async function exportFF(proj, media, opts) {
   const total = clips.reduce((a, c) => a + (c.out - c.in), 0);
   let logTail = [];
   let collecting = null;
-  onProgress(0, 'Loading ffmpeg engine (~31 MB, cached after first time)…');
+  onProgress(0, 'Loading engine…');
   const f = await getFF((m) => {
     logTail.push(m); if (logTail.length > 40) logTail.shift();
     if (collecting) collecting.push(m);
@@ -284,13 +305,14 @@ export async function exportChunked(proj, media, opts) {
   const outTotal = d.reduce((a, b) => a + b, 0) - X.reduce((a, b) => a + b, 0);
   const [W, H] = outputSize(clips, opts.res);
   let logTail = [], collecting = null, pieceBase = 0, pieceLen = 1;
-  onProgress(0, 'Loading ffmpeg engine (~31 MB, cached after first time)…');
+  onProgress(0, ff ? 'Starting…' : 'Loading engine…');
+  let stage = 'Encoding…';
   const f = await getFF((m) => {
     logTail.push(m); if (logTail.length > 40) logTail.shift();
     if (collecting) collecting.push(m);
     const t = /time=(\d+):(\d+):([\d.]+)/.exec(m);
-    if (t) { const s = +t[1] * 3600 + +t[2] * 60 + +t[3]; onProgress(Math.min(0.97, (pieceBase + Math.min(s, pieceLen)) / outTotal * 0.97), 'Encoding…'); }
-  });
+    if (t) { const s = +t[1] * 3600 + +t[2] * 60 + +t[3]; onProgress(Math.min(0.97, (pieceBase + Math.min(s, pieceLen)) / outTotal * 0.97), stage); }
+  }, (msg) => onProgress(0, msg));
   const ids = [...new Set(clips.map(c => c.mediaId))];
   const list = ids.map(id => { const m = media.get(id); if (!m) throw new Error('Missing media for a clip — re-import it.'); return { id, ...m }; });
   onProgress(0, 'Opening sources…');
@@ -350,7 +372,8 @@ export async function exportChunked(proj, media, opts) {
       const c = clips[i];
       const s0 = i > 0 ? X[i - 1] : 0, s1 = i < X.length ? X[i] : 0;
       const len = q(d[i] - s0 - s1);
-      onProgress(Math.min(0.97, pieceBase / outTotal * 0.97), `Shot ${i + 1}/${clips.length}…`);
+      stage = `Encoding shot ${i + 1} of ${clips.length}…`;
+      onProgress(Math.min(0.97, pieceBase / outTotal * 0.97), stage);
       if (len >= 1 / FPS) {
         const args = ['-hide_banner', '-nostdin', '-ss', (c.in + s0).toFixed(3), '-t', (len + 0.5).toFixed(3), '-i', paths.get(c.mediaId)];
         const fc = []; chain(fc, 0, c, s0, len, 'b');
@@ -365,6 +388,7 @@ export async function exportChunked(proj, media, opts) {
         const fc = [];
         chain(fc, 0, c, d[i] - s1, s1, 'x'); chain(fc, 1, n, 0, s1, 'y');
         fc.push(`[vx][vy]xfade=transition=fade:duration=${s1.toFixed(4)}:offset=0[vt]`, `[ax][ay]acrossfade=d=${s1.toFixed(4)}[at]`);
+        stage = `Crossfade ${i + 1}→${i + 2}…`;
         const vl = addCaps(fc, args, 2, 'vt', P[i] + d[i] - s1, s1);
         await runPiece(args, fc, vl, 'at', `p${pieces.length}.mkv`, s1);
       }

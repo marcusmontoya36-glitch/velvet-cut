@@ -2,7 +2,6 @@
 // shot planning + ordering, per-clip enhancement settings and "Dynamic camera" framing.
 // Everything runs in the browser by seeking a hidden <video> and reading small canvas frames,
 // so memory stays flat no matter how long the clip is (it never loads the whole file).
-import { once } from './exporter.js';
 
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const r2 = (x) => Math.round(x * 100) / 100;
@@ -126,39 +125,67 @@ function subject(d, g1, g2, w, h, sh) {
   return sw > 0 ? { cx: sx / sw / w, cy: sy / sw / h, conf: clamp(sw / ((w * h) / 4) * 4, 0, 1) } : { cx: 0.5, cy: 0.5, conf: 0 };
 }
 
+// ---------- shared analysis <video> ----------
+// One reusable hidden element. Calling unlockAnalysis() inside a tap "blesses" it on iOS so it may play
+// (muted, fast) later even in Low Power Mode, which blocks gesture-less autoplay.
+let AV = null;
+const BLANK = new URL('vendor/blank.mp4', location.href).href;
+export function analysisVideo() {
+  if (!AV) {
+    AV = document.createElement('video');
+    AV.muted = true; AV.defaultMuted = true; AV.playsInline = true;
+    AV.setAttribute('muted', ''); AV.setAttribute('playsinline', ''); AV.setAttribute('webkit-playsinline', '');
+    AV.preload = 'auto';
+    // must stay "visible" (in viewport, non-zero size) or iOS pauses it
+    AV.style.cssText = 'position:fixed;left:0;bottom:0;width:48px;height:27px;opacity:0.01;pointer-events:none;z-index:-1';
+    document.body.appendChild(AV);
+  }
+  return AV;
+}
+export function unlockAnalysis() {
+  const v = analysisVideo();
+  try { if (!v.getAttribute('src')) v.src = BLANK; const p = v.play(); if (p) p.then(() => v.pause(), () => {}); } catch {}
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function waitEv(el, ev, ms) {
+  return new Promise((res, rej) => {
+    const ok = () => { done(); res(true); }, bad = () => { done(); rej(new Error('Media error ' + (el.error?.code || ''))); };
+    const to = setTimeout(() => { done(); rej(new Error('timeout:' + ev)); }, ms);
+    const done = () => { clearTimeout(to); el.removeEventListener(ev, ok); el.removeEventListener('error', bad); };
+    el.addEventListener(ev, ok); el.addEventListener('error', bad);
+  });
+}
+async function setSrc(v, url) {
+  v.pause();
+  const p = waitEv(v, 'loadedmetadata', 10000);
+  v.src = url;
+  await p;
+}
+
 /**
- * Sample a media range. Seeks pairs (t, t+dt) so we can measure frame-to-frame motion.
- * Returns {samples, step}. Each sample: {t, luma, sd, sat, dark, bright, lap, vx, vy, resid, still, cut, sig, cx, cy, thumb}
+ * Sample a media range at ~2 frames/s on 120-px frames.
+ * Fast path: play the (muted) video at high speed and grab frames with requestVideoFrameCallback
+ * (no per-frame seeking, which is very slow on iOS). Each sample is a pair of consecutive frames so we
+ * can measure camera motion. Fallback: seek sampling with short timeouts. A watchdog guarantees it never hangs.
+ * Returns {samples, step, mode}.
  */
-export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 360 } = {}) {
-  const v = document.createElement('video');
-  v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto'; v.src = url;
-  await once(v, 'loadedmetadata');
-  try { await v.play(); v.pause(); } catch {} // muted inline play nudges iOS Safari to decode frames
+export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 240, perSec = 2, rate = 8 } = {}) {
+  const v = analysisVideo();
+  await setSrc(v, url);
   const span = Math.max(0.1, t1 - t0);
-  const step = clamp(span / maxSamples, 1 / 3, 2.5);      // ~3 samples/s, fewer on long clips
-  const dt = 0.045;                                        // ~1 frame at 30 fps, 2-3 at 60 fps
-  const AW = 160, AH = Math.max(36, Math.round(AW * (v.videoHeight || 9) / (v.videoWidth || 16) / 2) * 2);
+  const step = clamp(span / maxSamples, 1 / perSec, 2.5);
+  const AW = 120, AH = Math.max(36, Math.round(AW * (v.videoHeight || 9) / (v.videoWidth || 16) / 2) * 2);
   const cv = document.createElement('canvas'); cv.width = AW; cv.height = AH;
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   const tc = document.createElement('canvas'); tc.width = 96; tc.height = Math.round(96 * AH / AW);
   const tctx = tc.getContext('2d');
-  const grab = async (t) => {
-    const p = once(v, 'seeked'); v.currentTime = t;
-    await Promise.race([p, new Promise(r => setTimeout(r, 5000))]);
-    ctx.drawImage(v, 0, 0, AW, AH);
-    return ctx.getImageData(0, 0, AW, AH).data;
-  };
+  const n = AW * AH;
+  const grab = () => { ctx.drawImage(v, 0, 0, AW, AH); return ctx.getImageData(0, 0, AW, AH).data; };
+  const thumb = () => { tctx.drawImage(cv, 0, 0, tc.width, tc.height); return tc.toDataURL('image/jpeg', 0.55); };
   const out = [];
   let prevG = null, prevSig = null, prevHist = null;
-  const n = AW * AH;
-  for (let t = t0 + step / 2; t < t1; t += step) {
-    if (signal?.aborted) throw new Error('Cancelled');
-    const d1 = await grab(Math.min(t, t1 - dt - 0.01));
-    const g1 = toGray(d1, n);
-    const thumb = (tctx.drawImage(cv, 0, 0, tc.width, tc.height), tc.toDataURL('image/jpeg', 0.55));
-    const d2 = await grab(Math.min(t + dt, t1 - 0.005));
-    const g2 = toGray(d2, n);
+  const measure = (d1, d2, dt, t, th) => {
+    const g1 = toGray(d1, n), g2 = d2 === d1 ? g1 : toGray(d2, n);
     let luma = 0, sat = 0, dark = 0, bright = 0, sd = 0;
     for (let i = 0, j = 0; j < n; i += 4, j++) {
       luma += g1[j]; if (g1[j] < 24) dark++; if (g1[j] > 238) bright++;
@@ -167,31 +194,98 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 3
     }
     luma /= n; for (let j = 0; j < n; j++) sd += (g1[j] - luma) ** 2;
     sd = Math.sqrt(sd / n) / 255; luma /= 255; sat /= n; dark /= n; bright /= n;
-    const sh = shift(g1, g2, AW, AH);
+    const okDt = dt > 0.004 && dt < 0.6;
+    const sh = okDt ? shift(g1, g2, AW, AH) : { dx: 0, dy: 0, resid: 0 };
     const sig = signature(g1, AW, AH), hs = hist(d1, n);
-    const still = prevG ? sad(prevG, g1, AW, AH, 0, 0, 2) / 255 : null;   // vs previous sample (≈step s apart)
+    const still = prevG ? sad(prevG, g1, AW, AH, 0, 0, 2) / 255 : null;
     const cut = prevSig ? Math.min(1, sigDiff(prevSig, sig) * 4) * 0.5 + Math.min(1, histDiff(prevHist, hs) * 2.5) * 0.5 : 0;
     const subj = subject(d1, g1, g2, AW, AH, sh);
-    out.push({ t: r2(t), luma, sd, sat, dark, bright, lap: lapVar(g1, AW, AH), vx: sh.dx / AW / dt, vy: sh.dy / AW / dt, resid: sh.resid, still, cut, sig, ...subj, thumb });
+    out.push({ t: r2(t), dt: okDt ? dt : null, luma, sd, sat, dark, bright, lap: lapVar(g1, AW, AH),
+      vx: okDt ? sh.dx / AW / dt : null, vy: okDt ? sh.dy / AW / dt : null, resid: sh.resid, still, cut, sig, ...subj, thumb: th });
     prevG = g1; prevSig = sig; prevHist = hs;
     onTick && onTick(clamp((t - t0) / span, 0, 1));
+  };
+
+  // --- fast path: high-speed muted playback + requestVideoFrameCallback ---
+  const playback = () => new Promise((resolve, reject) => {
+    let next = t0 + step / 2, pend = null, last = -1, lastProg = performance.now(), done = false;
+    const finish = (err) => {
+      if (done) return; done = true; clearInterval(wd); v.removeEventListener('ended', onEnd);
+      try { v.pause(); v.playbackRate = 1; } catch {}
+      err ? reject(err) : resolve();
+    };
+    const handle = (mt) => {
+      if (done) return;
+      if (signal?.aborted) return finish(new Error('Cancelled'));
+      if (mt <= last + 1e-4) return;
+      last = mt; lastProg = performance.now();
+      try {
+        if (pend) { const d2 = grab(); measure(pend.d, d2, mt - pend.t, pend.t, pend.th); pend = null; }
+        else if (mt >= next && mt < t1) { pend = { d: grab(), t: mt }; pend.th = thumb(); while (next <= mt) next += step; }
+      } catch (e) { return finish(e); }
+      if (mt >= t1 - 0.03) finish();
+    };
+    const onEnd = () => { if (pend) measure(pend.d, pend.d, 0, pend.t, pend.th); pend = null; finish(); };
+    v.addEventListener('ended', onEnd);
+    if ('requestVideoFrameCallback' in v) {
+      const cb = (now, md) => { handle(md.mediaTime); if (!done) v.requestVideoFrameCallback(cb); };
+      v.requestVideoFrameCallback(cb);
+    } else {
+      const raf = () => { if (done) return; if (v.readyState >= 2) handle(v.currentTime); requestAnimationFrame(raf); };
+      requestAnimationFrame(raf);
+    }
+    // stall watchdog: no new frame for 2.5 s -> give up on playback mode
+    const wd = setInterval(() => { if (signal?.aborted) finish(new Error('Cancelled')); else if (performance.now() - lastProg > 2500) finish(new Error('stall')); }, 250);
+    try { if (t0 > 0.05) v.currentTime = t0; } catch {}
+    v.playbackRate = rate;
+    const pp = v.play();
+    if (pp) pp.catch((e) => finish(new Error('play blocked: ' + (e?.name || e))));
+  });
+
+  // --- fallback: seeks with short timeouts ---
+  const seekMode = async (from) => {
+    let fails = 0;
+    const seek = async (t) => { const p = waitEv(v, 'seeked', 1500); v.currentTime = t; await p; };
+    for (let t = from; t < t1; t += step) {
+      if (signal?.aborted) throw new Error('Cancelled');
+      try {
+        await seek(Math.min(t, t1 - 0.08)); const d1 = grab(); const th = thumb();
+        await seek(Math.min(t + 0.07, t1 - 0.01)); const d2 = grab();
+        measure(d1, d2, 0.07, t, th); fails = 0;
+      } catch (e) { if (++fails >= 3) break; }
+    }
+  };
+
+  let mode = 'playback';
+  try { await playback(); }
+  catch (e) {
+    if (e.message === 'Cancelled') throw e;
+    console.warn('playback sampling failed (' + e.message + '), falling back to seeking');
+    mode = 'seek';
+    const from = out.length ? out[out.length - 1].t + step : t0 + step / 2;
+    try { await seekMode(from); } catch (e2) { if (e2.message === 'Cancelled') throw e2; }
   }
-  v.removeAttribute('src'); v.load();
-  // shake = erratic velocity (deviation from neighbours) + very fast whips
+  try { v.pause(); v.removeAttribute('src'); v.load(); } catch {}
+  // shake = erratic camera motion (deviation from neighbours) expressed as displacement over a typical
+  // frame-pair gap, so it doesn't depend on playback speed / dropped frames
+  const dts = out.map(s => s.dt).filter(Boolean);
+  const dtNom = clamp(median(dts) || 0.1, 0.03, 0.3);
   for (let i = 0; i < out.length; i++) {
-    const a = out[i - 1] || out[i + 1] || out[i], b = out[i + 1] || out[i - 1] || out[i];
-    const mx = (a.vx + b.vx) / 2, my = (a.vy + b.vy) / 2;
-    const jit = Math.hypot(out[i].vx - mx, out[i].vy - my);
-    out[i].speed = Math.hypot(out[i].vx, out[i].vy);
-    out[i].shake = Math.max(jit, out[i].speed * 0.5);
+    const s = out[i];
+    if (s.vx == null) { s.speed = 0; s.shake = 0; continue; }
+    const nb = [out[i - 1], out[i + 1]].filter(x => x && x.vx != null);
+    const mx = nb.length ? nb.reduce((a, x) => a + x.vx, 0) / nb.length : s.vx;
+    const my = nb.length ? nb.reduce((a, x) => a + x.vy, 0) / nb.length : s.vy;
+    s.speed = Math.hypot(s.vx, s.vy);
+    s.shake = Math.max(Math.hypot(s.vx - mx, s.vy - my), s.speed * 0.5) * dtNom;
   }
-  return { samples: out, step };
+  return { samples: out, step, mode };
 }
 
 const STRICT = {
-  loose:  { blur: 0.22, blurAbs: 6,  dark: 0.07, blown: 0.93, shake: 1.6, still: 0.0025, minKeep: 0.8, dup: 0.018 },
-  normal: { blur: 0.35, blurAbs: 10, dark: 0.11, blown: 0.88, shake: 1.0, still: 0.004,  minKeep: 1.0, dup: 0.03 },
-  strict: { blur: 0.5,  blurAbs: 16, dark: 0.16, blown: 0.82, shake: 0.6, still: 0.006,  minKeep: 1.4, dup: 0.045 },
+  loose:  { blur: 0.22, blurAbs: 6,  dark: 0.07, blown: 0.93, shake: 0.07, still: 0.0015, minKeep: 0.8, dup: 0.018 },
+  normal: { blur: 0.35, blurAbs: 10, dark: 0.11, blown: 0.88, shake: 0.045, still: 0.0025, minKeep: 1.0, dup: 0.03 },
+  strict: { blur: 0.5,  blurAbs: 16, dark: 0.16, blown: 0.82, shake: 0.03, still: 0.004,  minKeep: 1.4, dup: 0.045 },
 };
 
 /** Flag bad samples. lapRef = reference sharpness (median of sharp-ish samples across ALL clips). */
@@ -204,6 +298,11 @@ function flagSamples(samples, lapRef, P) {
     if (s.shake > P.shake) r.push('shaky');
     s.bad = r;
   }
+  // a moderately shaky sample between two shaky ones is part of the same shaky stretch
+  samples.forEach((s, i) => {
+    const a = samples[i - 1], b = samples[i + 1];
+    if (a && b && !s.bad.includes('shaky') && s.shake > P.shake * 0.5 && a.bad.includes('shaky') && b.bad.includes('shaky')) s.bad.push('shaky');
+  });
   // static: consecutive samples nearly identical for >= ~1.5 s
   let i = 0;
   while (i < samples.length) {
@@ -219,7 +318,7 @@ function flagSamples(samples, lapRef, P) {
 function quality(s, lapRef) {
   const sharp = clamp(s.lap / Math.max(1, lapRef), 0, 1.5);
   const expo = 1 - clamp(Math.abs(s.luma - 0.47) / 0.47, 0, 1);
-  const steady = 1 - clamp(s.shake / 1.5, 0, 1);
+  const steady = 1 - clamp(s.shake / 0.07, 0, 1);
   const life = s.still == null ? 0.5 : clamp(s.still / 0.03, 0, 1); // some motion is good
   return +(sharp * 0.4 + expo * 0.25 + steady * 0.2 + life * 0.15).toFixed(3);
 }
@@ -234,7 +333,14 @@ export function planEdit(items, settings) {
   const lapRef = pct(allLap, 0.7) || 50;
   const keep = [], cuts = [];
   for (const it of items) {
-    flagSamples(it.samples, lapRef, P);
+    if (!it.samples.length) { // couldn't read frames (e.g. decoder busy) - keep the whole clip rather than drop it
+      keep.push({ mediaId: it.mediaId, name: it.name, in: it.in, out: it.out, dur: it.dur, w: it.w, h: it.h, score: 0.5, order: it.order, capture: it.capture, sig: new Float32Array(144).fill(-9), samples: [], thumb: '' });
+      continue;
+    }
+    // blur reference = geometric mean of the global and this clip's sharpness, so a clip that is simply less
+    // detailed (plain walls, soft light) isn't called blurry, but a clip much softer than the rest still is
+    const clipLap = pct(it.samples.filter(s => s.luma > 0.12 && s.luma < 0.88).map(s => s.lap), 0.7) || lapRef;
+    flagSamples(it.samples, Math.sqrt(lapRef * clipLap), P);
     const S = it.samples, h = it.step / 2;
     const bounds = (k) => [clamp(S[k].t - h, it.in, it.out), clamp(S[k].t + h, it.in, it.out)];
     // ignore isolated single bad samples (except exposure) - avoids chopping on one soft frame
@@ -255,7 +361,11 @@ export function planEdit(items, settings) {
     }
     if (runs.length) runs[runs.length - 1].end = it.out;
     // short good runs between bad -> cut
-    for (const r of runs) if (!r.bad && r.end - r.start < P.minKeep) { r.bad = true; r.short = true; }
+    runs.forEach((r, i) => {
+      if (r.bad) return;
+      const len = r.end - r.start, sandwiched = runs[i - 1]?.bad && runs[i + 1]?.bad;
+      if (len < P.minKeep || (sandwiched && len < P.minKeep * 1.6)) { r.bad = true; r.short = true; }
+    });
     // merge adjacent bad runs
     const merged = [];
     for (const r of runs) { const l = merged[merged.length - 1]; if (l && l.bad && r.bad) { l.end = r.end; l.ks.push(...r.ks); l.short = l.short && r.short; } else merged.push({ ...r }); }
@@ -277,7 +387,7 @@ export function planEdit(items, settings) {
   // near-duplicate shots: keep the better one
   const kept = [];
   for (const k of [...keep].sort((a, b) => b.score - a.score)) {
-    const twin = kept.find(o => sigDiff(o.sig, k.sig) < P.dup);
+    const twin = k.samples.length ? kept.find(o => o.samples.length && sigDiff(o.sig, k.sig) < P.dup) : null;
     if (twin) cuts.push({ mediaId: k.mediaId, name: k.name, in: k.in, out: k.out, dur: k.dur, w: k.w, h: k.h, score: k.score, order: k.order, capture: k.capture, id: uid(), reasons: ['duplicate'], thumb: k.thumb });
     else kept.push(k);
   }
@@ -317,6 +427,7 @@ const LEVELS = {
   3: { zMed: 1.3, zClose: 1.65, push: 0.22, pan: 0.1, punchMin: 4 },
 };
 function subjectOf(samples, a, b) {
+  if (!samples.length) return { cx: 0.5, cy: 0.5 };
   const ss = samples.filter(s => s.t >= a - 0.01 && s.t <= b + 0.01);
   const use = ss.length ? ss : samples;
   // confidence-weighted, outlier-robust (median), then pulled slightly to centre

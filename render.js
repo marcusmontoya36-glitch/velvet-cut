@@ -109,3 +109,56 @@ export function parseSrt(txt) {
   }
   return out;
 }
+
+// ---------- per-clip enhancement + dynamic camera (shared by preview, real-time export and ffmpeg export) ----------
+// Combined colour = project colour × clip auto-enhance.
+export function clipColor(proj, clip) {
+  const p = proj.color, e = clip?.enh;
+  if (!e) return p;
+  return { b: p.b + (e.b || 0), c: p.c * (e.c || 1), s: p.s * (e.s || 1), w: p.w };
+}
+const ease = (p) => (1 - Math.cos(Math.PI * Math.max(0, Math.min(1, p)))) / 2;
+// Camera state at progress p (0..1) through the clip: zoom z and the normalized centre of the crop window.
+export function camAt(cam, p) {
+  if (!cam) return { z: 1, cx: 0.5, cy: 0.5 };
+  const e = ease(p);
+  const z = Math.max(1, cam.z0 + (cam.z1 - cam.z0) * e);
+  const m = 0.5 / z;
+  const cx = Math.max(m, Math.min(1 - m, cam.x0 + (cam.x1 - cam.x0) * e));
+  const cy = Math.max(m, Math.min(1 - m, cam.y0 + (cam.y1 - cam.y0) * e));
+  return { z, cx, cy };
+}
+// CSS transform for the preview <video> (element is the stage size; overflow hidden on the stage)
+export function camCss(cam, p) {
+  const { z, cx, cy } = camAt(cam, p);
+  if (z <= 1.0005) return '';
+  return `scale(${z.toFixed(4)}) translate(${((0.5 - cx) * 100).toFixed(3)}%, ${((0.5 - cy) * 100).toFixed(3)}%)`;
+}
+/**
+ * ffmpeg filter that applies the camera move on a W×H frame (input already W*k × H*k).
+ * d = clip duration (s), off = seconds into the clip where this piece starts, n = piece duration.
+ */
+export function camFF(cam, d, off, W, H, fps = 30) {
+  if (!cam) return '';
+  const moving = Math.abs(cam.z1 - cam.z0) > 0.001 || Math.abs(cam.x1 - cam.x0) > 0.001 || Math.abs(cam.y1 - cam.y0) > 0.001;
+  if (!moving) {
+    if (cam.z0 <= 1.001) return `scale=${W}:${H}`;
+    // static crop - exact, no rounding jitter
+    const cw = `trunc(iw/${cam.z0.toFixed(4)}/2)*2`, ch = `trunc(ih/${cam.z0.toFixed(4)}/2)*2`;
+    return `crop=${cw}:${ch}:'max(0,min(iw-ow,iw*${cam.x0.toFixed(4)}-ow/2))':'max(0,min(ih-oh,ih*${cam.y0.toFixed(4)}-oh/2))',scale=${W}:${H}`;
+  }
+  const N = Math.max(1, d * fps).toFixed(2);
+  const E = `((1-cos(PI*min(1,(on+${(off * fps).toFixed(2)})/${N})))/2)`;
+  const lerp = (a, b) => `(${a.toFixed(4)}+(${(b - a).toFixed(4)})*${E})`;
+  return `zoompan=z='max(1,${lerp(cam.z0, cam.z1)})':x='max(0,min(iw-iw/zoom,iw*${lerp(cam.x0, cam.x1)}-iw/zoom/2))':y='max(0,min(ih-ih/zoom,ih*${lerp(cam.y0, cam.y1)}-ih/zoom/2))':d=1:s=${W}x${H}:fps=${fps}`;
+}
+// enhancement filters (denoise / colour / sharpen) for ffmpeg
+export function enhFF(proj, clip) {
+  const e = clip.enh || {};
+  const parts = [];
+  if (e.dn) parts.push(e.dn > 1 ? 'hqdn3d=3:2.5:6:6' : 'hqdn3d=1.5:1.5:4:4');
+  const col = ffColorFilter(clipColor(proj, clip));
+  if (col) parts.push(col);
+  if (e.sh) parts.push('unsharp=5:5:0.7:5:5:0');
+  return parts.join(',');
+}

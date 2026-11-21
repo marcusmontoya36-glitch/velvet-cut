@@ -41,7 +41,7 @@ export const listProjects = () => tx('projects', 'readonly', s => s.getAll());
 export async function gcMedia(extraKeep = []) {
   const projects = await listProjects();
   const keep = new Set(extraKeep);
-  for (const p of projects) for (const c of p.clips || []) keep.add(c.mediaId);
+  for (const p of projects) for (const c of [...(p.clips || []), ...(p.autoCuts || [])]) keep.add(c.mediaId);
   for (const id of await allMediaIds()) if (!keep.has(id)) await delMedia(id);
 }
 export async function estimate() {

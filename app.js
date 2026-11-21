@@ -1,6 +1,7 @@
 import * as DB from './db.js';
-import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK } from './render.js';
-import { exportFF, cancelFF, createRealtimeExport, once } from './exporter.js';
+import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss } from './render.js';
+import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
+import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings } from './autoedit.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
 import { loadAI, saveAI, HOOKS, providerReady, runHook } from './hooks.js';
 
@@ -13,7 +14,7 @@ const r2 = (x) => Math.round(x * 100) / 100;
 const newProject = () => ({ id: uid(), name: 'Untitled project', clips: [], captions: [], color: { b: 0, c: 1, s: 1, w: 0 }, created: Date.now(), updated: Date.now() });
 const S = {
   proj: newProject(), media: new Map(), sel: null, selCap: null, t: 0, playing: false, idx: -1,
-  pxs: 30, mutedAll: false, sugg: [], undo: [], redo: [], switching: false, exportJob: null,
+  pxs: 30, mutedAll: false, sugg: [], undo: [], redo: [], switching: false, exportJob: null, analysis: new Map(), autoJob: null,
 };
 window.__S = S; // handy for debugging
 
@@ -49,7 +50,7 @@ const selClip = () => clips().find(c => c.id === S.sel);
 const selCap = () => S.proj.captions.find(c => c.id === S.selCap);
 
 // ---------------- undo / mutate / autosave ----------------
-const snap = () => JSON.stringify({ clips: S.proj.clips, captions: S.proj.captions, color: S.proj.color });
+const snap = () => JSON.stringify({ clips: S.proj.clips, captions: S.proj.captions, color: S.proj.color, xfade: S.proj.xfade || 0, autoCuts: S.proj.autoCuts || [], autoEnh: S.proj.autoEnh || {} });
 function mutate(fn, { render = true } = {}) {
   S.undo.push(snap()); if (S.undo.length > 80) S.undo.shift(); S.redo = [];
   fn();
@@ -93,7 +94,7 @@ async function probe(url) {
   v.removeAttribute('src'); v.load();
   return info;
 }
-async function importFiles(files) {
+async function importFiles(files, { add = true } = {}) {
   files = [...files].filter(f => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv)$/i.test(f.name));
   if (!files.length) return toast('No video files found');
   DB.persist();
@@ -104,15 +105,18 @@ async function importFiles(files) {
     let info;
     try { info = await probe(url); }
     catch (e) { URL.revokeObjectURL(url); toast(`Can't play ${f.name} in this browser (codec?). Try converting to H.264 MP4.`, 6000); continue; }
-    const rec = { id, blob: f, name: f.name, type: f.type, ...info };
+    const capture = (await readCaptureTime(f)) || f.lastModified || null;
+    const rec = { id, blob: f, name: f.name, type: f.type, capture, order: Date.now() + added.length, ...info };
     S.media.set(id, { ...rec, url });
     try { await DB.putMedia(rec); } catch (e) { toast('Storage full — clip works now but won’t be saved: ' + e.message, 6000); }
     added.push({ id: uid(), mediaId: id, name: f.name.replace(/\.\w+$/, ''), in: 0, out: r2(info.duration), dur: info.duration, w: info.w, h: info.h, muted: false });
   }
-  if (!added.length) return;
+  if (!added.length) return [];
+  if (!add) return added;
   mutate(() => { S.proj.clips.push(...added); S.sel = added[0].id; });
   toast(`Added ${added.length} clip${added.length > 1 ? 's' : ''}`);
   if (S.idx < 0) seek(S.t);
+  return added;
 }
 
 // ---------------- preview playback ----------------
@@ -131,7 +135,7 @@ async function loadIdx(idx, local, play) {
     const target = c.in + local;
     if (Math.abs(player.currentTime - target) > 0.03) { player.currentTime = target; await once(player, 'seeked').catch(() => {}); }
     if (play) await player.play().catch(e => { S.playing = false; updatePlayBtn(); });
-  } finally { S.switching = false; }
+  } finally { S.switching = false; applyLook(); }
 }
 function seek(t) {
   S.t = clamp(t, 0, total());
@@ -166,8 +170,18 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
+function applyLook() {
+  const c = clips()[S.idx];
+  if (!c) { player.style.transform = ''; return; }
+  const f = cssFilter(clipColor(S.proj, c));
+  if (player.style.filter !== f) player.style.filter = f;
+  const st = starts()[S.idx], d = Math.max(0.01, c.out - c.in);
+  const p = clamp((S.t - st) / d, 0, 1);
+  player.style.transform = c.cam ? camCss(c.cam, p) : '';
+}
 function tickUI() {
   const T = total();
+  applyLook();
   $('#tc').textContent = `${fmtTime(S.t)} / ${fmtTime(T)}`;
   const sc = $('#scrub'); sc.max = T; if (document.activeElement !== sc) sc.value = S.t;
   $('#playhead').style.left = (S.t * S.pxs) + 'px';
@@ -190,7 +204,7 @@ function fitStage() {
 }
 function applyColor() {
   const c = S.proj.color;
-  player.style.filter = cssFilter(c);
+  player.style.filter = cssFilter(clipColor(S.proj, clips()[S.idx]));
   let tint = $('#stage .tint');
   if (!tint) { tint = document.createElement('div'); tint.className = 'tint'; $('#stage').insertBefore(tint, $('#capLayer')); }
   tint.style.background = warmthColor(c.w) || 'transparent';
@@ -254,8 +268,8 @@ function renderTimeline() {
     el.className = 'clip' + (c.id === S.sel ? ' sel' : '');
     el.style.left = st[i] * pxs + 'px'; el.style.width = Math.max(14, (c.out - c.in) * pxs - 2) + 'px';
     const m = S.media.get(c.mediaId);
-    if (m?.thumb) el.style.backgroundImage = `url(${m.thumb})`;
-    el.innerHTML = `<div class="badge">${c.muted ? '🔇' : ''}${m ? '' : '⚠️ missing'}</div><div class="nm">${esc(c.name)} · ${fmtTime(c.out - c.in)}</div><div class="h l"></div><div class="h r"></div>`;
+    const th = c.thumb || m?.thumb; if (th) el.style.backgroundImage = `url(${th})`;
+    el.innerHTML = `<div class="badge">${c.muted ? '🔇' : ''}${c.cam && c.cam.type !== 'wide' ? '🎥' + c.cam.type : ''}${c.enh ? '✨' : ''}${m ? '' : '⚠️ missing'}</div><div class="nm">${esc(c.name)} · ${fmtTime(c.out - c.in)}</div><div class="h l"></div><div class="h r"></div>`;
     el.dataset.id = c.id;
     el.onpointerdown = (e) => clipPointer(e, c, el);
     lane.appendChild(el);
@@ -357,7 +371,7 @@ function renderCapInspector() {
   $('#cpX').value = c.x; $('#cpY').value = c.y; $('#cpColor').value = c.color; $('#cpBox').checked = !!c.box;
 }
 function selectCap(id) { S.selCap = id; showTab('text'); renderCapInspector(); renderTimeline(); renderCapsOverlay.dirty = true; renderCapsOverlay(); }
-function renderAll() { renderTimeline(); renderClipInspector(); renderCapInspector(); applyColor(); fitStage(); renderCapsOverlay.dirty = true; renderCapsOverlay(); renderSugg(); }
+function renderAll() { renderAuto(); renderTimeline(); renderClipInspector(); renderCapInspector(); applyColor(); fitStage(); renderCapsOverlay.dirty = true; renderCapsOverlay(); renderSugg(); }
 function showTab(name) {
   $$('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   $$('.panel').forEach(p => p.classList.toggle('on', p.id === 'tab-' + name));
@@ -570,7 +584,7 @@ async function doExportFF() {
   }
   pause(); setExportUI(true); const t0 = performance.now();
   S.exportJob = { cancel: cancelFF };
-  try { finishExport(await exportFF(S.proj, S.media, exportOpts(prog)), t0); }
+  try { finishExport(await exportChunked(S.proj, S.media, exportOpts(prog)), t0); }
   catch (e) { $('#exStatus').textContent = 'Export failed: ' + (e.message || e); console.error(e); }
   S.exportJob = null; setExportUI(false);
 }
@@ -589,17 +603,174 @@ function downloadText(name, text) {
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
 
+// ---------------- Auto Edit ----------------
+const CAM_NAMES = { 1: 'Subtle', 2: 'Medium', 3: 'Bold' };
+function readAutoUI() {
+  return { order: $('#auOrder').value, xfade: +$('#auXfade').value, strict: $('#auStrict').value,
+    color: $('#auColor').checked, denoise: $('#auDenoise').checked, sharpen: $('#auSharpen').checked, stabilize: $('#auStab').checked,
+    camera: $('#auCam').checked, camLevel: +$('#auCamL').value };
+}
+function writeAutoUI(st) {
+  $('#auOrder').value = st.order; $('#auXfade').value = String(st.xfade); $('#auStrict').value = st.strict;
+  $('#auColor').checked = st.color; $('#auDenoise').checked = st.denoise; $('#auSharpen').checked = st.sharpen; $('#auStab').checked = st.stabilize;
+  $('#auCam').checked = st.camera; $('#auCamL').value = st.camLevel; $('#auCamV').textContent = CAM_NAMES[st.camLevel] || 'Medium';
+  $('#auCamL').disabled = !st.camera;
+}
+function bindAuto() {
+  writeAutoUI(loadAutoSettings());
+  const fi = $('#autoFile');
+  const pick = () => { if (S.autoJob) return toast('Auto Edit is already running'); fi.click(); };
+  $('#auPick').onclick = pick; $('#btnAuto').onclick = () => { showTab('auto'); pick(); }; $('#btnAuto2').onclick = pick;
+  fi.onchange = () => { const f = [...fi.files]; fi.value = ''; if (f.length) autoEdit(f); };
+  $('#auRerun').onclick = () => autoEdit(null);
+  $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
+  $('#auExport').onclick = doExportAuto;
+  $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
+  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL'].forEach(id => $(id).addEventListener('change', () => {
+    const st = readAutoUI(); saveAutoSettings(st); $('#auCamL').disabled = !st.camera;
+    if (S.analysis.size && S.proj.autoCuts && !S.autoJob) { $('#auStatus').textContent = 'Settings changed — re-editing…'; autoEdit(null); }
+  }));
+}
+const auProg = (f, msg) => { $('#auBar').style.width = Math.round(f * 100) + '%'; $('#auStatus').textContent = msg + (f > 0 && f < 1 ? ` · ${Math.round(f * 100)}%` : ''); };
+
+/** One-tap Auto Edit. files = new File[] to import, or null to re-run on this project's source videos. */
+async function autoEdit(files) {
+  if (S.autoJob) return;
+  const st = readAutoUI(); saveAutoSettings(st);
+  const ac = new AbortController(); S.autoJob = ac;
+  pause(); showTab('auto');
+  $('#auCancel').hidden = false; $('#auPick').disabled = $('#auRerun').disabled = true; $('#auExportBox').hidden = true;
+  $('#tab-auto').scrollIntoView?.({ block: 'nearest' });
+  const t0 = performance.now();
+  try {
+    let mids;
+    if (files) {
+      auProg(0, 'Importing…');
+      const added = await importFiles(files, { add: false });
+      if (!added?.length) throw new Error('No playable videos were imported');
+      mids = added.map(c => c.mediaId);
+    } else {
+      mids = [...new Set([...clips(), ...(S.proj.autoCuts || [])].map(c => c.mediaId))].filter(id => S.media.has(id));
+      if (!mids.length) throw new Error('No videos in this project yet — tap “Auto Edit — pick videos”.');
+    }
+    // 1) analyse (cached per video, so changing settings re-plans instantly)
+    const totalDur = mids.reduce((a, id) => a + (S.media.get(id).duration || 1), 0);
+    let done = 0;
+    const items = [];
+    for (let i = 0; i < mids.length; i++) {
+      const id = mids[i], m = S.media.get(id);
+      if (m.capture == null) m.capture = (await readCaptureTime(m.blob)) || m.blob.lastModified || null;
+      let an = S.analysis.get(id);
+      if (!an) {
+        an = await analyzeRange(m.url, 0, m.duration, { signal: ac.signal,
+          onTick: (f) => auProg(0.9 * (done + f * m.duration) / totalDur, `Analyzing video ${i + 1}/${mids.length} (blur, light, shake, scenes)`) });
+        S.analysis.set(id, an);
+      }
+      done += m.duration;
+      items.push({ mediaId: id, name: m.name.replace(/\.\w+$/, ''), in: 0, out: r2(m.duration), dur: m.duration, w: m.w, h: m.h,
+        order: m.order ?? i, capture: m.capture, samples: an.samples, step: an.step });
+    }
+    // 2) plan shots, enhancement and camera
+    auProg(0.92, 'Choosing the best shots…');
+    const plan = planEdit(items, st);
+    if (!plan.keep.length) throw new Error('Every part looked bad with these settings — try “Loose” sensitivity.');
+    const enh = {};
+    for (const it of items) enh[it.mediaId] = enhanceFor(it.samples, st);
+    let shots = plan.keep;
+    if (st.camera) shots = planCamera(shots, st.camLevel);
+    const newClips = shots.map((s, k) => {
+      const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
+      const e = (st.color || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.3) } : null;
+      return { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
+        enh: e, cam: st.camera ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
+    });
+    const cuts = plan.cuts.map(c => ({ id: c.id, mediaId: c.mediaId, name: c.name, in: c.in, out: c.out, dur: c.dur, w: c.w, h: c.h, reasons: c.reasons, thumb: c.thumb, score: c.score, capture: c.capture, order: c.order }));
+    mutate(() => {
+      S.proj.clips = newClips; S.proj.autoCuts = cuts; S.proj.autoEnh = enh; S.proj.xfade = st.xfade; S.sugg = [];
+      S.sel = newClips[0]?.id || null;
+      if (S.proj.name === 'Untitled project') { S.proj.name = 'Auto edit ' + new Date().toLocaleDateString(); $('#projName').value = S.proj.name; }
+    });
+    S.t = 0; seek(0);
+    auProg(1, `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s. Preview it, tweak anything on the timeline, then export.`);
+    window.__lastPlan = { plan, settings: st };
+  } catch (e) {
+    auProg(0, e.message === 'Cancelled' ? 'Cancelled.' : 'Auto Edit failed: ' + (e.message || e));
+    console.error(e);
+  } finally {
+    S.autoJob = null; $('#auCancel').hidden = true; $('#auPick').disabled = $('#auRerun').disabled = false;
+    renderAuto();
+  }
+}
+function renderAuto() {
+  const box = $('#auResult'); if (!box) return;
+  const cuts = S.proj.autoCuts || [];
+  const auto = clips().some(c => c.enh || c.cam) || cuts.length;
+  $('#auExportBox').hidden = !clips().length || !!S.autoJob;
+  if (!auto) { box.innerHTML = ''; return; }
+  const cutT = cuts.reduce((a, c) => a + c.out - c.in, 0);
+  const srcN = new Set([...clips(), ...cuts].map(c => c.mediaId)).size;
+  const camN = clips().filter(c => c.cam && c.cam.type !== 'wide').length;
+  box.innerHTML = `<div class="ausum"><b>${clips().length} shots · ${fmtTime(total())}</b> from ${srcN} video${srcN === 1 ? '' : 's'}${S.proj.xfade ? ` · ${S.proj.xfade}s crossfades` : ''}${camN ? ` · ${camN} camera moves` : ''}<br>
+    <span class="muted">Cut ${cuts.length} bad part${cuts.length === 1 ? '' : 's'} (${fmtTime(cutT)}). Tap Restore to put one back.</span></div>`;
+  for (const c of cuts) {
+    const row = document.createElement('div'); row.className = 'aucut';
+    row.innerHTML = `${c.thumb ? `<img src="${c.thumb}" alt="">` : '<img alt="">'}<div class="t">${esc(c.name)} · ${fmtTime(c.in)}–${fmtTime(c.out)} (${(c.out - c.in).toFixed(1)}s)<br>${c.reasons.map(r => `<span class="tag">${esc(r)}</span>`).join('')}</div><button>↩ Restore</button>`;
+    row.querySelector('button').onclick = () => restoreCut(c.id);
+    box.appendChild(row);
+  }
+  if (cuts.length > 1) {
+    const b = document.createElement('button'); b.className = 'wide'; b.textContent = '↩ Restore all';
+    b.onclick = () => [...cuts].forEach(c => restoreCut(c.id)); box.appendChild(b);
+  }
+}
+function restoreCut(id) {
+  const cut = (S.proj.autoCuts || []).find(c => c.id === id); if (!cut) return;
+  mutate(() => {
+    const cs = clips();
+    const clip = { id: uid(), mediaId: cut.mediaId, name: `${cut.name} · restored`, in: cut.in, out: cut.out, dur: cut.dur, w: cut.w, h: cut.h, muted: false,
+      enh: S.proj.autoEnh?.[cut.mediaId] ? { ...S.proj.autoEnh[cut.mediaId] } : null, cam: null, capture: cut.capture, order: cut.order, thumb: cut.thumb || '' };
+    // put it back next to its neighbours from the same video (by source time)
+    let at = -1;
+    cs.forEach((c, i) => { if (c.mediaId === cut.mediaId && c.in <= cut.in) at = i; });
+    if (at < 0) { const j = cs.findIndex(c => c.mediaId === cut.mediaId); at = j < 0 ? cs.length - 1 : j - 1; }
+    cs.splice(at + 1, 0, clip); S.sel = clip.id;
+    S.proj.autoCuts = S.proj.autoCuts.filter(c => c.id !== id);
+  });
+  toast('Restored ↩ (undo with ↶)');
+}
+async function doExportAuto() {
+  if (!clips().length) return toast('Nothing to export yet');
+  if (S.exportJob) return;
+  pause();
+  const bar = $('#auExBar'), stt = $('#auExStatus'), link = $('#auExLink'), pv = $('#auPreview');
+  $('#auExport').disabled = true; $('#auCancel').hidden = false; link.hidden = true; pv.hidden = true;
+  const t0 = performance.now();
+  S.exportJob = { cancel: cancelFF };
+  const p = (f, msg) => { bar.style.width = Math.round(f * 100) + '%'; stt.textContent = msg + (f > 0 && f < 1 ? ` ${Math.round(f * 100)}%` : ''); };
+  try {
+    const res = await exportChunked(S.proj, S.media, exportOpts(p));
+    if (link.href) URL.revokeObjectURL(link.href);
+    link.href = URL.createObjectURL(res.blob);
+    link.download = `${(S.proj.name || 'auto-edit').replace(/[^\w-]+/g, '_')}.mp4`;
+    link.textContent = `⬇ Save MP4 (${(res.blob.size / 1048576).toFixed(1)} MB, ${res.W}×${res.H}, ${fmtTime(res.duration)})`;
+    link.hidden = false; pv.src = link.href; pv.hidden = false;
+    stt.textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s. Watch it below. On iPhone: tap Save, then Share → Save Video.`;
+    window.__lastExport = res;
+  } catch (e) { stt.textContent = 'Export failed: ' + (e.message || e) + ' — try 480p, or Export tab → Real-time export.'; console.error(e); }
+  S.exportJob = null; $('#auExport').disabled = false; $('#auCancel').hidden = true;
+}
+
 // ---------------- projects / settings ----------------
 async function openProject(id) {
   const p = await DB.getProject(id); if (!p) return;
   pause();
   for (const m of S.media.values()) URL.revokeObjectURL(m.url);
   S.media.clear();
-  for (const mid of new Set(p.clips.map(c => c.mediaId))) {
+  for (const mid of new Set([...p.clips, ...(p.autoCuts || [])].map(c => c.mediaId))) {
     const rec = await DB.getMedia(mid);
     if (rec) S.media.set(mid, { ...rec, url: URL.createObjectURL(rec.blob) });
   }
-  S.proj = p; S.sel = p.clips[0]?.id || null; S.selCap = null; S.undo = []; S.redo = []; S.sugg = [];
+  S.proj = p; S.sel = p.clips[0]?.id || null; S.selCap = null; S.undo = []; S.redo = []; S.sugg = []; S.analysis.clear();
   $('#projName').value = p.name; player.dataset.mid = ''; S.t = 0; S.idx = -1;
   localStorage.setItem('vc.last', p.id);
   renderAll(); seek(0);
@@ -672,6 +843,7 @@ function bind() {
   if (localStorage.getItem('vc.age18')) $('#ageGate').classList.remove('show');
 
   $$('.tabs button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+  bindAuto();
   const fi = $('#fileInput');
   $('#btnImport').onclick = $('#btnImport2').onclick = () => fi.click();
   fi.onchange = () => { importFiles(fi.files); fi.value = ''; };
@@ -781,4 +953,4 @@ async function init() {
 init();
 
 // test/debug hooks
-window.VC = { S, importFiles, splitAt, seek, play, pause, analyze, applySugg, addCaption, mutate, saveProject, openProject, doExportFF, doExportRT, total, showTab, renderAll };
+window.VC = { S, importFiles, autoEdit, restoreCut, doExportAuto, splitAt, seek, play, pause, analyze, applySugg, addCaption, mutate, saveProject, openProject, doExportFF, doExportRT, total, showTab, renderAll };

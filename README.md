@@ -25,6 +25,37 @@ Share → **Add to Home Screen** for an app icon. Options:
 
 Videos you import on the phone stay in that phone's Safari storage.
 
+
+## ⚡ Auto Edit (one tap)
+
+Tap **⚡ Auto Edit**, pick one or more videos, and the app edits them on the device:
+
+1. **Analyze** each video at low resolution (160 px frames, about 3 samples/s, fewer on long clips) by seeking a hidden `<video>`.
+   The whole file is never loaded into memory, so long clips are fine.
+2. **Cut bad shots.** Parts that are blurry (low Laplacian variance compared with the sharpest footage), too dark, blown out,
+   shaky (erratic global motion between frames), frozen/static, too short, or near-duplicates get cut. Every cut is listed
+   with its reasons and a thumbnail, and **↩ Restore** puts it back. Sensitivity can be Loose, Normal or Strict.
+3. **Arrange.** Shots are split at scene changes, then ordered by capture time (MP4/MOV `mvhd` date), by file order, or
+   best shots first. Crossfades are optional (0.25 to 0.7 s).
+4. **Enhance.** Per-video automatic brightness, contrast and saturation (shown in the preview). Denoise (`hqdn3d`), sharpen (`unsharp`)
+   and stabilize (`deshake`, only on slightly shaky kept shots) are applied in the export.
+5. **🎥 Dynamic camera** (toggle plus Subtle/Medium/Bold). Adds Ken Burns push-ins and pull-backs, punch-in cuts (a long shot is split
+   into 2 or 3 "angles"), wide, medium and close framings, and slow pans and tilts. The crop centre comes from motion,
+   skin tone and a centre bias, is median-smoothed per shot, and is clamped so the frame never shows black edges.
+   Framings never repeat back to back. It shows live in the preview and in both export engines.
+6. **Export MP4 for iPhone.** Uses the chunked ffmpeg.wasm export: the source files are mounted read-only with WORKERFS (not
+   copied into memory), each shot and each crossfade is encoded as a small piece (H.264 yuv420p, 30 fps, capped bitrate), and
+   then the pieces are joined. Video is stream-copied, and audio is encoded once to AAC with `+faststart`. The result can be
+   previewed in-page before saving.
+
+After an Auto Edit, the normal timeline tools still work: trim, split, reorder, delete, captions, undo.
+Changing a setting re-plans instantly because the analysis is cached.
+
+**Limits:** analysis runs at about 1 to 2× real time on a desktop and is usually slower on a phone. Export speed is
+about 0.5 to 1× real time at 720p on a desktop. On iPhone, keep exports to roughly 5 minutes at 720p (or use 480p). The
+encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color
+and camera moves but not crossfades, denoise or sharpen.
+
 ## Features
 
 | Area | What works |

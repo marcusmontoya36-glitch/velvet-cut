@@ -1,6 +1,6 @@
 // Offline cache for the app shell + ffmpeg engine. User media never goes through here (blob: URLs).
-const V = 'vc-v2';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'render.js', 'exporter.js', 'ai.js', 'hooks.js', 'manifest.webmanifest',
+const V = 'vc-v3';
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'render.js', 'exporter.js', 'ai.js', 'autoedit.js', 'hooks.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'vendor/ffmpeg/index.js', 'vendor/ffmpeg/classes.js', 'vendor/ffmpeg/const.js',
   'vendor/ffmpeg/errors.js', 'vendor/ffmpeg/types.js', 'vendor/ffmpeg/utils.js', 'vendor/ffmpeg/worker.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });

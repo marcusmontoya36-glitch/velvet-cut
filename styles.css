@@ -118,3 +118,16 @@ h3{margin:14px 0 4px;font-size:15px}
   .brand span{display:none}
   .zoom input{width:110px}
 }
+
+/* Auto Edit */
+button.big{padding:14px 12px;font-size:16px;font-weight:700}
+.auopts{margin-top:14px;border-top:1px solid var(--line);padding-top:8px}
+.auopts summary{cursor:pointer;font-weight:600;margin-bottom:6px}
+.checks{display:grid;gap:2px;margin:6px 0}
+.ausum{margin:8px 0;font-size:13px}
+.aucut{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line)}
+.aucut img{width:72px;height:40px;object-fit:cover;border-radius:6px;background:#000;flex:none}
+.aucut .t{flex:1;font-size:12px;min-width:0}
+.aucut .tag{display:inline-block;margin:2px 3px 0 0;padding:1px 6px;border-radius:9px;background:#3a1f2c;color:#ff9fc4;font-size:10px}
+.aupreview{width:100%;margin-top:8px;border-radius:10px;background:#000;max-height:50vh}
+#player{transform-origin:50% 50%;will-change:transform}

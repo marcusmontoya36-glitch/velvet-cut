@@ -1,6 +1,6 @@
 // Export engines: (1) ffmpeg.wasm (single-thread, no special headers needed), (2) real-time canvas + MediaRecorder.
 import { FFmpeg } from './vendor/ffmpeg/index.js';
-import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter } from './render.js';
+import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF } from './render.js';
 
 let ff = null;
 const abs = (p) => new URL(p, location.href).href;
@@ -164,7 +164,8 @@ export function createRealtimeExport(proj, media, opts) {
     const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
     const ctx = cv.getContext('2d');
     const hasFilter = 'filter' in ctx;
-    const filt = cssFilter(proj.color), warm = warmthColor(proj.color.w);
+    let filt = cssFilter(proj.color), cam = null, camP = 0;
+    const warm = warmthColor(proj.color.w);
     const vstream = cv.captureStream(30);
     const stream = new MediaStream([...vstream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
     const rec = new MediaRecorder(stream, { mimeType: mime || undefined, videoBitsPerSecond: Math.round(W * H * 30 * 0.12), audioBitsPerSecond: 160000 });
@@ -176,7 +177,13 @@ export function createRealtimeExport(proj, media, opts) {
       ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
       if (v.videoWidth) {
         if (hasFilter) ctx.filter = filt;
-        ctx.drawImage(v, ...containRect(v.videoWidth, v.videoHeight, W, H));
+        const { z, cx, cy } = camAt(cam, camP);
+        if (z > 1.0005) { // dynamic camera: draw the crop window of the letterboxed frame
+          const [dx, dy, dw, dh] = containRect(v.videoWidth, v.videoHeight, W, H);
+          const sw = W / z, sh = H / z, sx = cx * W - sw / 2, sy = cy * H - sh / 2;
+          const k = W / sw;
+          ctx.drawImage(v, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k);
+        } else ctx.drawImage(v, ...containRect(v.videoWidth, v.videoHeight, W, H));
         if (hasFilter) ctx.filter = 'none';
       }
       if (warm) { ctx.globalCompositeOperation = 'soft-light'; ctx.fillStyle = warm; ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
@@ -187,6 +194,7 @@ export function createRealtimeExport(proj, media, opts) {
       const c = clips[i], m = media.get(c.mediaId);
       if (v.src !== m.url) v.src = m.url;
       await seekTo(v, c.in);
+      filt = cssFilter(clipColor(proj, c)); cam = c.cam || null; camP = 0;
       gain.gain.value = c.muted ? 0 : 1;
       draw(offset);
       if (!started) { rec.start(1000); started = true; } else if (rec.state === 'paused') rec.resume();
@@ -198,6 +206,7 @@ export function createRealtimeExport(proj, media, opts) {
           if (done) return;
           if (cancelled) return finish();
           const gt = offset + (Math.min(v.currentTime, c.out) - c.in);
+          camP = (Math.min(v.currentTime, c.out) - c.in) / Math.max(0.01, c.out - c.in);
           draw(gt);
           onProgress(Math.min(0.99, gt / total), `Recording ${Math.round(gt)}/${Math.round(total)} s (real-time)…`);
           if (v.currentTime >= c.out - 0.02 || v.ended) return finish();
@@ -237,4 +246,145 @@ export function once(el, ev) {
     const cleanup = () => { el.removeEventListener(ev, ok); el.removeEventListener('error', bad); };
     el.addEventListener(ev, ok); el.addEventListener('error', bad);
   });
+}
+
+// ---------- Chunked export (memory-safe, used by Auto Edit and the main ffmpeg export) ----------
+// Sources are mounted read-only with WORKERFS (no copy into wasm memory). Each shot body and each
+// crossfade transition is encoded as its own small piece with per-clip enhance + dynamic camera,
+// then pieces are joined with the concat demuxer (video stream-copied, audio re-encoded once to AAC).
+async function mountSources(f, list) {
+  // list: [{id, blob, name, type}] -> Map(id -> path)
+  const paths = new Map();
+  try {
+    try { await f.createDir('/src'); } catch {}
+    const blobs = list.map((m, i) => ({ name: `m${i}.${extOf(m.name, m.type)}`, data: m.blob }));
+    await f.mount('WORKERFS', { blobs }, '/src');
+    list.forEach((m, i) => paths.set(m.id, `/src/${blobs[i].name}`));
+    return { paths, mounted: true };
+  } catch (e) {
+    console.warn('WORKERFS mount failed, copying into memory', e);
+    for (let i = 0; i < list.length; i++) {
+      const name = `in${i}.${extOf(list[i].name, list[i].type)}`;
+      await f.writeFile(name, new Uint8Array(await list[i].blob.arrayBuffer()));
+      paths.set(list[i].id, name);
+    }
+    return { paths, mounted: false };
+  }
+}
+
+export async function exportChunked(proj, media, opts) {
+  const { onProgress = () => {} } = opts;
+  const clips = proj.clips;
+  if (!clips.length) throw new Error('Timeline is empty');
+  const FPS = 30, q = (x) => Math.round(x * FPS) / FPS;
+  const d = clips.map(c => Math.max(2 / FPS, q(c.out - c.in)));
+  const xf = +proj.xfade || 0;
+  const X = clips.slice(0, -1).map((c, j) => { const x = q(Math.min(xf, d[j] / 3, d[j + 1] / 3)); return x >= 3 / FPS ? x : 0; });
+  const P = []; { let t = 0; for (const di of d) { P.push(t); t += di; } } // preview-timeline start of each clip
+  const outTotal = d.reduce((a, b) => a + b, 0) - X.reduce((a, b) => a + b, 0);
+  const [W, H] = outputSize(clips, opts.res);
+  let logTail = [], collecting = null, pieceBase = 0, pieceLen = 1;
+  onProgress(0, 'Loading ffmpeg engine (~31 MB, cached after first time)…');
+  const f = await getFF((m) => {
+    logTail.push(m); if (logTail.length > 40) logTail.shift();
+    if (collecting) collecting.push(m);
+    const t = /time=(\d+):(\d+):([\d.]+)/.exec(m);
+    if (t) { const s = +t[1] * 3600 + +t[2] * 60 + +t[3]; onProgress(Math.min(0.97, (pieceBase + Math.min(s, pieceLen)) / outTotal * 0.97), 'Encoding…'); }
+  });
+  const ids = [...new Set(clips.map(c => c.mediaId))];
+  const list = ids.map(id => { const m = media.get(id); if (!m) throw new Error('Missing media for a clip — re-import it.'); return { id, ...m }; });
+  onProgress(0, 'Opening sources…');
+  const { paths, mounted } = await mountSources(f, list);
+  const hasAudio = new Map();
+  for (const id of ids) {
+    collecting = [];
+    try { await f.exec(['-hide_banner', '-i', paths.get(id)]); } catch {}
+    hasAudio.set(id, collecting.some(l => /Stream #.*Audio:/.test(l)));
+    collecting = null;
+  }
+  // captions (preview-timeline times)
+  const caps = opts.burnCaptions ? (proj.captions || []).filter(c => c.text && c.end > c.start) : [];
+  for (let j = 0; j < caps.length; j++) await f.writeFile(`cap${j}.png`, await captionPng(caps[j], W, H));
+
+  // video+audio chain for one portion of a clip -> labels
+  const chain = (fc, inIdx, c, start, len, tag) => {
+    const N = Math.round(len * FPS);
+    const cam = c.cam && (c.cam.z0 > 1.001 || c.cam.z1 > 1.001) ? c.cam : null;
+    const k = cam && !c.enh?.stab ? Math.min(2, Math.max(1, Math.min(c.w || W, c.h || H) / Math.min(W, H))) : 1;
+    const NW = Math.round(W * k / 2) * 2, NH = Math.round(H * k / 2) * 2;
+    const v = [`[${inIdx}:v]setpts=PTS-STARTPTS`, `fps=${FPS}`, `scale=${NW}:${NH}:force_original_aspect_ratio=decrease`, `pad=${NW}:${NH}:(ow-iw)/2:(oh-ih)/2:black`, 'setsar=1'];
+    if (c.enh?.stab) v.push('deshake=rx=32:ry=32:edge=mirror');
+    if (cam) v.push(camFF(cam, d[clips.indexOf(c)], start, W, H, FPS)); else if (NW !== W) v.push(`scale=${W}:${H}`);
+    const en = enhFF(proj, c); if (en) v.push(en);
+    v.push('setsar=1', 'format=yuv420p', `tpad=stop_mode=clone:stop_duration=1`, `trim=end_frame=${N}`, 'setpts=PTS-STARTPTS');
+    fc.push(v.join(',') + `[v${tag}]`);
+    if (hasAudio.get(c.mediaId) && !c.muted) fc.push(`[${inIdx}:a]asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${(N / FPS).toFixed(4)}[a${tag}]`);
+    else fc.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${(N / FPS).toFixed(4)}[a${tag}]`);
+  };
+  const addCaps = (fc, args, nInputs, vlab, G, len) => {
+    let last = vlab, n = nInputs;
+    caps.forEach((cap, j) => {
+      const a = cap.start - G, b = cap.end - G;
+      if (b <= 0 || a >= len) return;
+      args.push('-i', `cap${j}.png`);
+      fc.push(`[${last}][${n}:v]overlay=0:0:eof_action=repeat:enable='between(t,${a.toFixed(3)},${b.toFixed(3)})'[c${n}]`);
+      last = `c${n}`; n++;
+    });
+    return last;
+  };
+  // cap the bitrate so output size (and wasm memory) stays predictable: ~6 Mb/s at 720p, ~13 Mb/s at 1080p
+  const maxr = Math.round(W * H * 6.5 * (opts.crf && opts.crf <= 19 ? 1.5 : opts.crf >= 28 ? 0.6 : 1));
+  const enc = ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', String(opts.crf || 23), '-maxrate', String(maxr), '-bufsize', String(maxr * 2),
+    '-pix_fmt', 'yuv420p', '-r', String(FPS),
+    '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2'];
+  const pieces = [];
+  const runPiece = async (args, fc, vl, al, name, len) => {
+    args.push('-filter_complex', fc.join(';'), '-map', `[${vl}]`, '-map', `[${al}]`, ...enc, name);
+    pieceLen = len;
+    const code = await f.exec(args);
+    if (code !== 0) throw new Error('ffmpeg failed (code ' + code + '): ' + logTail.slice(-6).join(' | '));
+    pieces.push(name); pieceBase += len;
+  };
+  try {
+    for (let i = 0; i < clips.length; i++) {
+      const c = clips[i];
+      const s0 = i > 0 ? X[i - 1] : 0, s1 = i < X.length ? X[i] : 0;
+      const len = q(d[i] - s0 - s1);
+      onProgress(Math.min(0.97, pieceBase / outTotal * 0.97), `Shot ${i + 1}/${clips.length}…`);
+      if (len >= 1 / FPS) {
+        const args = ['-hide_banner', '-nostdin', '-ss', (c.in + s0).toFixed(3), '-t', (len + 0.5).toFixed(3), '-i', paths.get(c.mediaId)];
+        const fc = []; chain(fc, 0, c, s0, len, 'b');
+        const vl = addCaps(fc, args, 1, 'vb', P[i] + s0, len);
+        await runPiece(args, fc, vl, 'ab', `p${pieces.length}.mkv`, len);
+      }
+      if (s1 > 0) { // crossfade into next shot
+        const n = clips[i + 1];
+        const args = ['-hide_banner', '-nostdin',
+          '-ss', (c.in + d[i] - s1).toFixed(3), '-t', (s1 + 0.5).toFixed(3), '-i', paths.get(c.mediaId),
+          '-ss', n.in.toFixed(3), '-t', (s1 + 0.5).toFixed(3), '-i', paths.get(n.mediaId)];
+        const fc = [];
+        chain(fc, 0, c, d[i] - s1, s1, 'x'); chain(fc, 1, n, 0, s1, 'y');
+        fc.push(`[vx][vy]xfade=transition=fade:duration=${s1.toFixed(4)}:offset=0[vt]`, `[ax][ay]acrossfade=d=${s1.toFixed(4)}[at]`);
+        const vl = addCaps(fc, args, 2, 'vt', P[i] + d[i] - s1, s1);
+        await runPiece(args, fc, vl, 'at', `p${pieces.length}.mkv`, s1);
+      }
+    }
+    onProgress(0.97, 'Joining shots…');
+    await f.writeFile('list.txt', new TextEncoder().encode(pieces.map(p => `file '${p}'`).join('\n')));
+    const code = await f.exec(['-hide_banner', '-nostdin', '-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c:v', 'copy', '-tag:v', 'avc1',
+      '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4']);
+    if (code !== 0) throw new Error('join failed: ' + logTail.slice(-6).join(' | '));
+    for (const p of pieces) try { await f.deleteFile(p); } catch {}
+    pieces.length = 0;
+    const data = await f.readFile('out.mp4');
+    try { await f.deleteFile('out.mp4'); } catch {}
+    onProgress(1, 'Done');
+    return { blob: new Blob([data.buffer], { type: 'video/mp4' }), ext: 'mp4', W, H, duration: outTotal };
+  } finally {
+    for (const p of pieces) try { await f.deleteFile(p); } catch {}
+    for (let j = 0; j < caps.length; j++) try { await f.deleteFile(`cap${j}.png`); } catch {}
+    try { await f.deleteFile('list.txt'); } catch {}
+    if (mounted) { try { await f.unmount('/src'); } catch {} }
+    else for (const p of paths.values()) try { await f.deleteFile(p); } catch {}
+  }
 }

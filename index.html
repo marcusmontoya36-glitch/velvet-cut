@@ -34,6 +34,7 @@
   <div class="brand"><div class="logo">VC</div><span>Velvet&nbsp;Cut</span></div>
   <input id="projName" class="projname" value="Untitled project" aria-label="Project name">
   <div class="topbtns">
+    <button id="btnAuto" class="primary" title="Auto Edit: pick videos and let the app edit them">⚡<span class="lbl"> Auto Edit</span></button>
     <button id="btnProjects" title="Projects">📁<span class="lbl"> Projects</span></button>
     <button id="btnSave" title="Save project">💾<span class="lbl"> Save</span></button>
     <button id="btnPrivacy" title="Privacy blur (Esc)">🙈</button>
@@ -49,7 +50,8 @@
         <div id="capLayer" class="caplayer"></div>
         <div id="dropHint" class="drophint">
           <div>Drop videos here<br><small>mp4 · mov · webm — stays on this device</small></div>
-          <button id="btnImport2" class="primary">＋ Import videos</button>
+          <button id="btnAuto2" class="primary">⚡ Auto Edit videos</button>
+          <button id="btnImport2">＋ Import (manual)</button>
         </div>
       </div>
     </div>
@@ -63,14 +65,59 @@
 
   <section class="side">
     <nav class="tabs">
-      <button data-tab="clip" class="on">Clip</button>
+      <button data-tab="auto" class="on">Auto ⚡</button>
+      <button data-tab="clip">Clip</button>
       <button data-tab="text">Text</button>
       <button data-tab="color">Color</button>
       <button data-tab="ai">AI ✨</button>
       <button data-tab="export">Export</button>
     </nav>
 
-    <div class="panel on" id="tab-clip">
+    <div class="panel on" id="tab-auto">
+      <button id="auPick" class="primary wide big">⚡ Auto Edit — pick videos</button>
+      <input id="autoFile" type="file" accept="video/*,.mp4,.mov,.m4v,.webm" multiple hidden>
+      <button id="auRerun" class="wide">↻ Re-run on this project's videos</button>
+      <div class="progress"><div id="auBar"></div></div>
+      <div id="auStatus" class="muted small">Pick one or more videos. Everything is analysed and edited on this device.</div>
+      <button id="auCancel" class="danger wide" hidden>Cancel</button>
+      <div id="auResult"></div>
+      <div id="auExportBox" hidden>
+        <button id="auExport" class="primary wide big">⬇ Export MP4 for iPhone</button>
+        <div class="progress"><div id="auExBar"></div></div>
+        <div id="auExStatus" class="muted small"></div>
+        <a id="auExLink" class="btn primary wide" hidden download>Save video</a>
+        <video id="auPreview" class="aupreview" controls playsinline webkit-playsinline hidden></video>
+      </div>
+      <details class="auopts" open>
+        <summary>Auto Edit settings</summary>
+        <div class="grid2">
+          <label>Order<select id="auOrder">
+            <option value="capture">Capture time</option>
+            <option value="file">File order</option>
+            <option value="best">Best shots first</option>
+          </select></label>
+          <label>Crossfade<select id="auXfade">
+            <option value="0">Off (hard cuts)</option><option value="0.25">Quick 0.25 s</option><option value="0.4">Short 0.4 s</option><option value="0.7">Soft 0.7 s</option>
+          </select></label>
+        </div>
+        <label>Cut sensitivity<select id="auStrict">
+          <option value="loose">Loose — only obvious bad shots</option>
+          <option value="normal">Normal</option>
+          <option value="strict">Strict — keep only the best</option>
+        </select></label>
+        <div class="checks">
+          <label class="chk"><input type="checkbox" id="auColor"> Fix brightness / contrast / color</label>
+          <label class="chk"><input type="checkbox" id="auDenoise"> Denoise</label>
+          <label class="chk"><input type="checkbox" id="auSharpen"> Sharpen</label>
+          <label class="chk"><input type="checkbox" id="auStab"> Stabilize slightly shaky shots</label>
+        </div>
+        <label class="chk"><input type="checkbox" id="auCam"> 🎥 Dynamic camera (zooms, punch-ins, pans, multi-angle feel)</label>
+        <label>Camera intensity: <b id="auCamV">Medium</b><input id="auCamL" type="range" min="1" max="3" step="1" value="2"></label>
+        <p class="muted small">Analysis runs at low resolution on-device. Color/zoom preview live; denoise, sharpen, stabilize and crossfades are applied in the exported MP4. For the cloud upscaler, use AI ✨ → Enhance after exporting.</p>
+      </details>
+    </div>
+
+    <div class="panel" id="tab-clip">
       <div id="clipEmpty" class="muted">Import videos, then tap a clip on the timeline.</div>
       <div id="clipInspector" hidden>
         <div class="field"><b id="ciName">clip</b> <span id="ciInfo" class="muted"></span></div>

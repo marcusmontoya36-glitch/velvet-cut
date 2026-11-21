@@ -1,7 +1,8 @@
 import * as DB from './db.js';
-import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt } from './render.js';
+import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut } from './render.js';
+import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
-import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue } from './autoedit.js';
+import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue, lookOf, extendShots, editLength } from './autoedit.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
 import { loadAI, saveAI, HOOKS, providerReady, runHook } from './hooks.js';
 
@@ -39,11 +40,11 @@ const html = (s) => { const d = document.createElement('div'); d.innerHTML = s; 
 const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
 const clips = () => S.proj.clips;
-const total = () => clips().reduce((a, c) => a + (c.out - c.in), 0);
-function starts() { let t = 0; return clips().map(c => { const s = t; t += c.out - c.in; return s; }); }
+const total = () => clips().reduce((a, c) => a + clipDur(c), 0);
+function starts() { let t = 0; return clips().map(c => { const s = t; t += clipDur(c); return s; }); }
 function locate(t) {
   const st = starts(), cs = clips();
-  for (let i = 0; i < cs.length; i++) { const d = cs[i].out - cs[i].in; if (t < st[i] + d - 1e-4 || i === cs.length - 1) return { idx: i, local: clamp(t - st[i], 0, d) }; }
+  for (let i = 0; i < cs.length; i++) { const d = clipDur(cs[i]); if (t < st[i] + d - 1e-4 || i === cs.length - 1) return { idx: i, local: clamp(t - st[i], 0, d) }; }
   return { idx: -1, local: 0 };
 }
 const selClip = () => clips().find(c => c.id === S.sel);
@@ -184,11 +185,14 @@ async function loadIdx(idx, local, play) {
       player.dataset.mid = c.mediaId; player.src = m.url;
       await waitEv(player, 'loadedmetadata', 10000).catch(() => {});
     }
-    S.idx = idx;
+    S.idx = idx; S.rev = null;
     player.muted = S.mutedAll || c.muted;
-    const target = c.in + local;
+    player.playbackRate = clipSpeed(c);
+    const target = srcAt(c, local);
     if (Math.abs(player.currentTime - target) > 0.03) { player.currentTime = target; await waitEv(player, 'seeked', 3000).catch(() => {}); }
-    if (play) await player.play().catch(e => { S.playing = false; updatePlayBtn(); });
+    // starting inside a boomerang's reverse half: run the clock with the frame we have
+    if (play && c.boom && local > fwdDur(c)) { S.rev = { t0: performance.now() - (local - fwdDur(c)) * 1000 }; }
+    else if (play) await player.play().catch(e => { S.playing = false; updatePlayBtn(); });
   } finally { S.switching = false; applyLook(); prepNext(); }
 }
 // load + seek the next shot into the hidden player (paused) so the crossfade can start instantly
@@ -201,7 +205,7 @@ async function prepNext() {
   try {
     if (el.dataset.mid !== n.mediaId) { el.dataset.mid = n.mediaId; el.src = m.url; await waitEv(el, 'loadedmetadata', 5000).catch(() => {}); }
     if (tok !== prepToken) return;
-    el.pause();
+    el.pause(); el.playbackRate = clipSpeed(n);
     if (Math.abs(el.currentTime - n.in) > 0.03) { el.currentTime = n.in; await waitEv(el, 'seeked', 2000).catch(() => {}); }
     if (tok === prepToken) el.dataset.ready = `${j}:${n.in}`;
   } catch {}
@@ -211,26 +215,80 @@ function startXf(j, X) {
   S.xf = { j, X, started: false };
   const el = player2;
   el.muted = true; // iOS allows one audible video at a time; audio switches at the cut
-  el.style.zIndex = 2; player.style.zIndex = 1;
+  setZ(el, 2); setZ(player, 1);
   if (el.dataset.ready !== `${j}:${n.in}`) { el.currentTime = n.in; }
+  el.playbackRate = clipSpeed(n);
   el.play().then(() => { if (S.xf && S.xf.j === j) S.xf.started = true; }).catch(() => { S.xf = null; });
 }
 function setXfAlpha(a) {
-  if (S.proj.xfadeType === 'black') { player.style.opacity = a < 0.5 ? 1 - 2 * a : 0; player2.style.opacity = a < 0.5 ? 0 : 2 * a - 1; }
-  else { player.style.opacity = 1; player2.style.opacity = a; }
+  if (S.proj.xfadeType === 'black') { setOp(player, a < 0.5 ? 1 - 2 * a : 0); setOp(player2, a < 0.5 ? 0 : 2 * a - 1); }
+  else { setOp(player, 1); setOp(player2, a); }
 }
 function swapXf() {
-  const j = S.xf.j; S.xf = null;
+  const j = S.xf.j; S.xf = null; S.rev = null;
   const old = player; player = player2; player2 = old;
-  old.pause(); old.style.opacity = 0; old.style.zIndex = 0; old.dataset.ready = '';
-  player.style.opacity = 1; player.style.zIndex = 1;
+  old.pause(); setOp(old, 0); setZ(old, 0); old.dataset.ready = '';
+  setOp(player, 1); setZ(player, 1);
   S.idx = j;
   player.muted = S.mutedAll || clips()[j].muted;
   applyLook(); prepNext();
 }
 function cancelXf() {
-  if (!S.xf) { player2.style.opacity = 0; player.style.opacity = 1; return; }
-  S.xf = null; player2.pause(); player2.style.opacity = 0; player.style.opacity = 1;
+  if (!S.xf) { setOp(player2, 0); setOp(player, 1); return; }
+  S.xf = null; player2.pause(); setOp(player2, 0); setOp(player, 1);
+}
+// ---- GL layer: fisheye shots and the reversed half of boomerangs are drawn on a canvas over their player ----
+const fxLayers = new Map();
+function fxOf(el) {
+  let o = fxLayers.get(el);
+  if (!o) {
+    const cv = document.createElement('canvas'); cv.className = 'fxlayer'; cv.style.opacity = 0;
+    $('#stage').insertBefore(cv, $('#focusLayer'));
+    let fx = null; try { fx = createFx(cv); } catch (e) { console.warn('WebGL unavailable', e); }
+    o = { cv, fx, on: false }; fxLayers.set(el, o);
+  }
+  return o;
+}
+function setOp(el, a) {
+  el._op = a; const o = fxLayers.get(el);
+  if (o && o.on) { el.style.opacity = 0; o.cv.style.opacity = a; } else { el.style.opacity = a; if (o) o.cv.style.opacity = 0; }
+}
+function setZ(el, z) { el.style.zIndex = z; const o = fxLayers.get(el); if (o) o.cv.style.zIndex = z; }
+// draw el's clip through WebGL (src = the video, or a cached frame while a boomerang plays backwards)
+function fxDraw(el, c, p, src) {
+  const o = fxOf(el); if (!o.fx) return false;
+  const st = $('#stage'), dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.min(1280, Math.round(st.clientWidth * dpr)), h = Math.round(w * st.clientHeight / Math.max(1, st.clientWidth));
+  if (o.cv.width !== w || o.cv.height !== h) { o.cv.width = w; o.cv.height = h; }
+  src = src || el;
+  const ok = o.fx.draw(src, src.videoWidth || src.width, src.videoHeight || src.height, c.cam, p);
+  const f = cssFilter(clipColor(S.proj, c)); if (o.cv.style.filter !== f) o.cv.style.filter = f;
+  o.cv.style.zIndex = el.style.zIndex || getComputedStyle(el).zIndex || 0;
+  if (ok !== o.on) { o.on = ok; setOp(el, el._op ?? +(el.style.opacity || 1)); }
+  return ok;
+}
+function fxOff(el) { const o = fxLayers.get(el); if (o && o.on) { o.on = false; setOp(el, el._op ?? 1); } }
+// boomerang frame cache (forward half), small frames, released when the shot ends
+const boomCache = { id: null, frames: [] };
+function boomCapture(el, c) {
+  if (!c?.boom || !el.videoWidth) return;
+  if (boomCache.id !== c.id) { boomCache.id = c.id; boomCache.frames = []; }
+  const fr = boomCache.frames, t = el.currentTime;
+  if (fr.length && t <= fr[fr.length - 1].t + 0.02) return;
+  if (fr.length > 120) return;
+  const w = Math.min(640, el.videoWidth), h = Math.round(w * el.videoHeight / el.videoWidth);
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h; cv.getContext('2d').drawImage(el, 0, 0, w, h);
+  fr.push({ t, cv });
+}
+function boomFrame(c, t) {
+  if (boomCache.id !== c.id || !boomCache.frames.length) return null;
+  let b = boomCache.frames[0]; for (const f of boomCache.frames) if (Math.abs(f.t - t) < Math.abs(b.t - t)) b = f;
+  return b.cv;
+}
+// timeline-local time of the clip in el
+function localOf(el, c) {
+  if (el === player && S.rev) return fwdDur(c) + (performance.now() - S.rev.t0) / 1000;
+  return clamp((el.currentTime - c.in) / clipSpeed(c), 0, fwdDur(c));
 }
 function seek(t) {
   S.t = clamp(t, 0, total());
@@ -252,22 +310,28 @@ async function play() {
   const { idx, local } = locate(S.t);
   await loadIdx(idx, local, true);
 }
-function pause() { S.playing = false; player.pause(); cancelXf(); updatePlayBtn(); }
+function pause() { S.playing = false; player.pause(); cancelXf(); if (S.rev) { const c = clips()[S.idx]; S.rev = null; if (c) { S.t = clamp(S.t, 0, total()); seek(S.t); } } updatePlayBtn(); }
 function updatePlayBtn() { $('#btnPlay').textContent = S.playing ? '❚❚' : '▶'; }
 function loop() {
   if (S.playing && !S.switching && S.idx >= 0) {
     const c = clips()[S.idx];
     if (!c) pause();
     else {
-      const st = starts()[S.idx];
-      S.t = st + (player.currentTime - c.in);
+      const st = starts()[S.idx], D = clipDur(c);
+      // boomerang: at the end of the forward half, freeze the video and play the captured frames backwards
+      if (c.boom && !S.rev && (player.currentTime >= c.out - 0.03 || player.ended)) { boomCapture(player, c); player.pause(); S.rev = { t0: performance.now() }; }
+      if (!S.rev) boomCapture(player, c);
+      if (S.xf) { const n = clips()[S.xf.j]; if (n?.boom) boomCapture(player2, n); }
+      const l = localOf(player, c);
+      S.t = st + Math.min(D, l);
       const last = S.idx >= clips().length - 1;
-      const X = last ? 0 : xfadeAt(S.idx), rem = c.out - player.currentTime;
+      const X = last ? 0 : xfadeAt(S.idx), rem = D - l;
       if (X > 0 && !S.xf && rem <= X && rem > 0.06) startXf(S.idx + 1, rem);
-      if (S.xf) setXfAlpha(clamp(1 - (c.out - player.currentTime) / S.xf.X, 0, 1));
-      if (player.currentTime >= c.out - 0.03 || player.ended) {
+      if (S.xf) setXfAlpha(clamp(1 - rem / S.xf.X, 0, 1));
+      const ended = c.boom ? l >= D - 0.03 : (player.currentTime >= c.out - 0.03 || player.ended);
+      if (ended) {
         if (S.xf && S.xf.started) swapXf();
-        else if (!last) { S.t = st + (c.out - c.in); loadIdx(S.idx + 1, 0, true); }
+        else if (!last) { S.t = st + D; S.rev = null; loadIdx(S.idx + 1, 0, true); }
         else { pause(); S.t = total(); }
       }
     }
@@ -276,18 +340,22 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
-function lookFor(el, c, p) {
+function lookFor(el, c, p, src) {
   const f = cssFilter(clipColor(S.proj, c));
   if (el.style.filter !== f) el.style.filter = f;
-  el.style.transform = c.cam ? camCss(c.cam, p) : '';
+  el.style.transform = c.cam ? camCss(c.cam, p, el.clientWidth || 1600, el.clientHeight || 900) : '';
+  // fisheye (and boomerang reverse frames) need WebGL; everything else is a CSS transform on the <video>
+  if ((hasFish(c.cam) || src) && fxDraw(el, c, p, src)) return;
+  fxOff(el);
 }
 function applyLook() {
   const c = clips()[S.idx];
-  if (!c) { player.style.transform = ''; return; }
-  const d = Math.max(0.01, c.out - c.in);
-  const p = S.playing ? clamp((player.currentTime - c.in) / d, 0, 1) : clamp((S.t - starts()[S.idx]) / d, 0, 1);
-  lookFor(player, c, p);
-  if (S.xf) { const n = clips()[S.xf.j]; if (n) lookFor(player2, n, clamp((player2.currentTime - n.in) / Math.max(0.01, n.out - n.in), 0, 1)); }
+  if (!c) { player.style.transform = ''; fxOff(player); return; }
+  const l = S.playing ? localOf(player, c) : clamp(S.t - starts()[S.idx], 0, clipDur(c));
+  const rsrc = S.playing && S.rev ? boomFrame(c, srcAt(c, l)) : null;
+  lookFor(player, c, camP(c, l), rsrc);
+  if (S.xf) { const n = clips()[S.xf.j]; if (n) lookFor(player2, n, camP(n, localOf(player2, n))); }
+  else fxOff(player2);
   renderFocusDot();
 }
 function tickUI() {
@@ -465,11 +533,16 @@ function renderClipInspector() {
   $('#clipEmpty').hidden = !!c; $('#clipInspector').hidden = !c;
   if (!c) return;
   $('#ciName').textContent = c.name;
-  $('#ciInfo').textContent = ` ${c.w}×${c.h} · source ${fmtTime(c.dur)} · using ${fmtTime(c.out - c.in)}`;
+  const xt = c.boom ? ' · boomerang' : '', sp = clipSpeed(c) < 1 ? ` · ${clipSpeed(c)}× slow-mo` : '';
+  $('#ciInfo').textContent = ` ${c.w}×${c.h} · source ${fmtTime(c.dur)} · using ${fmtTime(c.out - c.in)}${sp}${xt} → ${fmtTime(clipDur(c))} on the timeline`;
   if (document.activeElement !== $('#ciIn')) $('#ciIn').value = c.in;
   if (document.activeElement !== $('#ciOut')) $('#ciOut').value = c.out;
   $('#ciIn').max = c.dur; $('#ciOut').max = c.dur;
   $('#ciCam').value = c.cam?.type || 'none'; $('#ciFlip').checked = !!c.cam?.flip; $('#ciFlip').disabled = !c.cam;
+  $('#ciAngle').value = c.cam?.angle || 'none'; $('#ciAngle').disabled = !c.cam;
+  $('#ciLens').value = c.cam?.roll && c.cam?.fish ? 'both' : c.cam?.roll ? 'dutch' : c.cam?.fish ? 'fish' : 'none'; $('#ciLens').disabled = !c.cam;
+  $('#ciSpeed').value = String(clipSpeed(c)); if ($('#ciSpeed').selectedIndex < 0) $('#ciSpeed').value = '1';
+  $('#ciBoom').checked = !!c.boom;
   const fo = c.focus || S.proj.focus?.[c.mediaId];
   $('#ciFocusInfo').textContent = fo ? `Focus set${fo.track?.length ? `, tracked over ${fo.track.length} frames` : ''}${c.focus ? ' (this shot only)' : ' (whole video)'}.` : 'No focus: crops follow motion and skin tone automatically.';
   $('#ciFocus').classList.toggle('on', S.focusMode);
@@ -723,25 +796,27 @@ const camLevel = () => +($('#auCamL')?.value || 2);
 function subjForClip(c, a = c.in, b = c.out) {
   return subjectFromFocus(c.focus || S.proj.focus?.[c.mediaId], a, b) || subjectOf(S.analysis.get(c.mediaId)?.samples, a, b);
 }
-function recam(c, type = c.cam?.type, flip = c.cam?.flip) {
-  c.cam = !type || type === 'none' ? null : camFor(type, subjForClip(c), LEVELS[camLevel()] || LEVELS[2], !!flip);
+function recam(c, type = c.cam?.type, flip = c.cam?.flip, look = lookOf(c.cam)) {
+  c.cam = !type || type === 'none' ? null : camFor(type, subjForClip(c), LEVELS[camLevel()] || LEVELS[2], !!flip, look);
 }
 // stage (0..1) <-> video content (0..1), accounting for letterboxing, the current camera zoom and mirroring
 function stageGeom() {
   const st = $('#stage'), W = st.clientWidth, H = st.clientHeight, c = clips()[S.idx];
   const [dx, dy, dw, dh] = containRect(player.videoWidth || W, player.videoHeight || H, W, H);
-  const d = c ? Math.max(0.01, c.out - c.in) : 1, p = c ? clamp((player.currentTime - c.in) / d, 0, 1) : 0;
-  return { W, H, dx, dy, dw, dh, cam: camAt(c?.cam || null, p), flip: !!c?.cam?.flip };
+  const p = c ? camP(c, clamp(S.t - starts()[S.idx], 0, clipDur(c))) : 0;
+  return { W, H, dx, dy, dw, dh, cam: camAt(c?.cam || null, p), flip: !!c?.cam?.flip, look: c?.cam || null };
 }
 function stageToContent(sx, sy) {
   const g = stageGeom(); if (g.flip) sx = 1 - sx;
+  [sx, sy] = outToCrop(g.look, sx, sy, g.W / g.H);
   const ex = g.cam.cx + (sx - 0.5) / g.cam.z, ey = g.cam.cy + (sy - 0.5) / g.cam.z;
   return [clamp((ex * g.W - g.dx) / g.dw, 0, 1), clamp((ey * g.H - g.dy) / g.dh, 0, 1)];
 }
 function contentToStage(x, y) {
   const g = stageGeom();
   const ex = (g.dx + x * g.dw) / g.W, ey = (g.dy + y * g.dh) / g.H;
-  let sx = 0.5 + (ex - g.cam.cx) * g.cam.z; const sy = 0.5 + (ey - g.cam.cy) * g.cam.z;
+  let sx = 0.5 + (ex - g.cam.cx) * g.cam.z, sy = 0.5 + (ey - g.cam.cy) * g.cam.z;
+  [sx, sy] = cropToOut(g.look, sx, sy, g.W / g.H);
   if (g.flip) sx = 1 - sx;
   return [sx, sy];
 }
@@ -793,6 +868,14 @@ function bindFocus() {
   $('#ciFocusClr').onclick = () => { const c = selClip() || clips()[S.idx]; if (!c) return; mutate(() => { if (c.focus) { c.focus = null; recam(c); } else if (S.proj.focus?.[c.mediaId]) { delete S.proj.focus[c.mediaId]; clips().forEach(k => { if (k.mediaId === c.mediaId) recam(k); }); } }); };
   $('#ciCam').onchange = (e) => { const c = selClip(); if (!c) return; mutate(() => recam(c, e.target.value, $('#ciFlip').checked)); seek(S.t); };
   $('#ciFlip').onchange = (e) => { const c = selClip(); if (!c?.cam) return; mutate(() => recam(c, c.cam.type, e.target.checked)); seek(S.t); };
+  const L = () => LEVELS[camLevel()] || LEVELS[2], fishK = () => +$('#auFish').value || 0.18;
+  $('#ciAngle').onchange = (e) => { const c = selClip(); if (!c?.cam) return; const lk = lookOf(c.cam), v = e.target.value;
+    mutate(() => recam(c, c.cam.type, c.cam.flip, { ...lk, angle: v === 'none' ? undefined : v, ks: v === 'none' ? undefined : (lk.ks || L().ks) })); seek(S.t); };
+  $('#ciLens').onchange = (e) => { const c = selClip(); if (!c?.cam) return; const lk = lookOf(c.cam), v = e.target.value;
+    const roll = v === 'dutch' || v === 'both' ? (lk.roll || L().roll) : undefined, fish = v === 'fish' || v === 'both' ? (lk.fish || fishK()) : undefined;
+    mutate(() => recam(c, c.cam.type, c.cam.flip, { ...lk, roll, fish })); seek(S.t); };
+  $('#ciSpeed').onchange = (e) => { const c = selClip(); if (!c) return; const v = +e.target.value; mutate(() => { if (v >= 1) delete c.speed; else c.speed = v; }); seek(S.t); };
+  $('#ciBoom').onchange = (e) => { const c = selClip(); if (!c) return; mutate(() => { if (e.target.checked) c.boom = true; else delete c.boom; }); seek(S.t); };
   $('#exXf').onchange = (e) => { const v = parseXf(e.target.value); mutate(() => { S.proj.xfade = v.xfade; S.proj.xfadeType = v.xfadeType; }); };
 }
 
@@ -801,13 +884,16 @@ const CAM_NAMES = { 1: 'Subtle', 2: 'Medium', 3: 'Bold' };
 function readAutoUI() {
   return { order: $('#auOrder').value, xfade: $('#auXfade').value, strict: $('#auStrict').value, altAngle: $('#auAlt').checked,
     color: $('#auColor').checked, denoise: $('#auDenoise').checked, sharpen: $('#auSharpen').checked, stabilize: $('#auStab').checked,
-    camera: $('#auCam').checked, camLevel: +$('#auCamL').value };
+    camera: $('#auCam').checked, camLevel: +$('#auCamL').value,
+    angles: $('#auAngles').checked, dutch: $('#auDutch').checked, fish: $('#auFish').value, extend: $('#auExtend').value, slowmo: $('#auSlow').value };
 }
 function writeAutoUI(st) {
   $('#auOrder').value = st.order; $('#auXfade').value = String(st.xfade); $('#auStrict').value = st.strict;
   $('#auColor').checked = st.color; $('#auDenoise').checked = st.denoise; $('#auSharpen').checked = st.sharpen; $('#auStab').checked = st.stabilize;
   $('#auCam').checked = st.camera; $('#auCamL').value = st.camLevel; $('#auCamV').textContent = CAM_NAMES[st.camLevel] || 'Medium';
   $('#auCamL').disabled = !st.camera; $('#auAlt').checked = !!st.altAngle;
+  $('#auAngles').checked = !!st.angles; $('#auDutch').checked = !!st.dutch; $('#auFish').value = String(st.fish ?? '0');
+  $('#auExtend').value = String(st.extend || '0'); $('#auSlow').value = st.slowmo || 'smooth';
 }
 function bindAuto() {
   writeAutoUI(loadAutoSettings());
@@ -819,7 +905,7 @@ function bindAuto() {
   $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
   $('#auExport').onclick = doExportAuto;
   $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
-  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt'].forEach(id => $(id).addEventListener('change', () => {
+  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow'].forEach(id => $(id).addEventListener('change', () => {
     const st = readAutoUI(); saveAutoSettings(st); $('#auCamL').disabled = !st.camera;
     if (S.analysis.size && S.proj.autoCuts && !S.autoJob) { $('#auStatus').textContent = 'Settings changed — re-editing…'; autoEdit(null); }
   }));
@@ -874,22 +960,33 @@ async function autoEdit(files) {
     for (const it of items) enh[it.mediaId] = enhanceFor(it.samples, st);
     let shots = plan.keep;
     const xf = parseXf(st.xfade);
-    if (st.camera) shots = planCamera(shots, st.camLevel, { xfade: xf.xfade, altAngle: st.altAngle, subjFn: (s, a, b) => subjectFromFocus(S.proj.focus?.[s.mediaId], a, b) });
+    // Extend (only the real footage): slow-mo on the best stretches, boomerangs, replays from another angle
+    const ext = extendShots(shots, st.extend, { xfade: xf.xfade, lapRef: plan.lapRef });
+    shots = ext.shots;
+    if (st.camera) shots = planCamera(shots, st.camLevel, { xfade: xf.xfade, altAngle: st.altAngle, angles: st.angles, dutch: st.dutch, fish: st.fish,
+      subjFn: (s, a, b) => subjectFromFocus(S.proj.focus?.[s.mediaId], a, b) });
+    else for (const s of shots) { delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType; }
     const newClips = shots.map((s, k) => {
       const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
       const e = (st.color || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
-      return { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
+      const o = { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}${s.ext === 'slow' ? ' · slow-mo' : s.ext === 'boom' ? ' · boomerang' : s.ext === 'replay' ? ' · replay' : ''}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
         enh: e, cam: st.camera ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
+      if (s.speed && s.speed < 1) o.speed = s.speed;
+      if (s.boom) o.boom = true;
+      if (s.ext) o.ext = s.ext;
+      return o;
     });
     const cuts = plan.cuts.map(c => ({ id: c.id, mediaId: c.mediaId, name: c.name, in: c.in, out: c.out, dur: c.dur, w: c.w, h: c.h, reasons: c.reasons, thumb: c.thumb, score: c.score, capture: c.capture, order: c.order }));
     mutate(() => {
       S.proj.clips = newClips; S.proj.autoCuts = cuts; S.proj.autoEnh = enh; S.proj.xfade = xf.xfade; S.proj.xfadeType = xf.xfadeType; S.sugg = [];
+      S.proj.slowmo = st.slowmo || 'smooth';
+      S.proj.extendInfo = ext.ops.length ? { base: +ext.base.toFixed(2), length: +ext.length.toFixed(2), target: +ext.target.toFixed(2), ops: ext.ops } : null;
       S.sel = newClips[0]?.id || null;
       if (S.proj.name === 'Untitled project') { S.proj.name = 'Auto edit ' + new Date().toLocaleDateString(); $('#projName').value = S.proj.name; }
     });
     S.t = 0; seek(0);
     auProg(1, `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s. Preview it, tweak anything on the timeline, then export.`);
-    window.__lastPlan = { plan, settings: st };
+    window.__lastPlan = { plan, settings: st, ext };
   } catch (e) {
     auProg(0, e.message === 'Cancelled' ? 'Cancelled.' : 'Auto Edit failed: ' + (e.message || e));
     console.error(e);
@@ -908,7 +1005,11 @@ function renderAuto() {
   const cutT = cuts.reduce((a, c) => a + c.out - c.in, 0);
   const srcN = new Set([...clips(), ...cuts].map(c => c.mediaId)).size;
   const camN = clips().filter(c => c.cam && c.cam.type !== 'wide').length;
-  box.innerHTML = `<div class="ausum"><b>${clips().length} shots · ${fmtTime(total())}</b> from ${srcN} video${srcN === 1 ? '' : 's'}${S.proj.xfade ? ` · ${S.proj.xfade}s ${S.proj.xfadeType === 'black' ? 'dips to black' : 'crossfades'}` : ' · hard cuts'}${camN ? ` · ${camN} camera moves` : ''}<br>
+  const outLen = total() - xfadeDurations(clips(), S.proj.xfade || 0).reduce((x, y) => x + y, 0);
+  const angN = clips().filter(c => c.cam?.angle).length, fishN = clips().filter(c => hasFish(c.cam)).length;
+  const ei = S.proj.extendInfo, cnt = (k) => (ei?.ops || []).filter(o => o.kind === k).length;
+  const extLine = ei ? `<br>⏱ Extended ${ei.base.toFixed(1)} s → ${ei.length.toFixed(1)} s (target ${ei.target.toFixed(1)} s): ${cnt('slow')} slow-mo, ${cnt('boom')} boomerang, ${cnt('replay')} replay${cnt('replay') === 1 ? '' : 's'}` : '';
+  box.innerHTML = `<div class="ausum"><b>${clips().length} shots · ${fmtTime(outLen)}</b> from ${srcN} video${srcN === 1 ? '' : 's'}${S.proj.xfade ? ` · ${S.proj.xfade}s ${S.proj.xfadeType === 'black' ? 'dips to black' : 'crossfades'}` : ' · hard cuts'}${camN ? ` · ${camN} camera moves` : ''}${angN ? ` · ${angN} from above/below` : ''}${fishN ? ` · ${fishN} fisheye` : ''}${extLine}<br>
     <span class="muted">Cut ${cuts.length} bad part${cuts.length === 1 ? '' : 's'} (${fmtTime(cutT)}). Tap Restore to put one back.</span></div>`;
   for (const c of cuts) {
     const row = document.createElement('div'); row.className = 'aucut';

@@ -48,6 +48,18 @@ Tap **⚡ Auto Edit**, pick one or more videos, and the app edits them on the de
    subject from motion plus skin-tone saliency, or a **focus point**: Clip tab → 🎯 Set focus → tap her in the preview. The point is
    template-tracked through the video and drives every crop and move. You can also pick a framing per clip.
    No person or gender classification is done. Everything shows live in the preview and in both export engines.
+   **Camera height and lens:** about every 3rd shot is seen **from above** (looking down: keystone with the top of the frame
+   closer, plus a slow downward tilt) or **from below** (looking up), with a slight **dutch tilt** on some. An optional
+   **fisheye** lens (Subtle/Strong) goes on some low-angle and close shots. These are perspective warps of your own footage,
+   always fully inside the frame so there are no black edges. Medium and close framings stay dominant, and wide is at most 1 in 5.
+   The preview uses CSS `matrix3d` (fisheye and boomerangs use WebGL). The ffmpeg export uses `perspective` and `lenscorrection`,
+   and the real-time export uses the same WebGL shader. You can override any of it per clip in the Clip tab.
+5b. **⏱ Extend** (Off / ×1.5 / ×2 / 30 s / 60 s). Makes the edit longer **using only your footage**, with no generated frames:
+   - slow motion (0.5×) on the sharpest, steadiest stretches. At export, in-between frames are made with `minterpolate`
+     (Smooth) or frame blending (Fast); 60 fps sources just get retimed.
+   - boomerang loops (forward, then back) of best moments.
+   - replays of best moments later on from another "camera": above or below, mirrored, sometimes fisheye.
+   Per clip: Speed (0.75 / 0.5 / 0.33×) and 🔁 Boomerang in the Clip tab.
 6. **Export MP4 for iPhone.** Uses the chunked ffmpeg.wasm export: the source files are mounted read-only with WORKERFS (not
    copied into memory), each shot and each crossfade is encoded as a small piece (H.264 yuv420p, 30 fps, capped bitrate), and
    then the pieces are joined. Video is stream-copied, and audio is encoded once to AAC with `+faststart`. The result can be

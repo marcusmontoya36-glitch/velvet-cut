@@ -117,6 +117,22 @@
         <label class="chk"><input type="checkbox" id="auCam"> 🎥 Dynamic camera (zooms, punch-ins, pans, multi-angle feel)</label>
         <label>Camera intensity: <b id="auCamV">Medium</b><input id="auCamL" type="range" min="1" max="3" step="1" value="2"></label>
         <label class="chk"><input type="checkbox" id="auAlt"> Alt angles (occasional mirrored shots)</label>
+        <label class="chk"><input type="checkbox" id="auAngles"> ⬇⬆ Angles from above &amp; below (simulated camera height)</label>
+        <label class="chk"><input type="checkbox" id="auDutch"> Slight dutch tilt on some angled shots</label>
+        <div class="grid2">
+          <label>Fisheye lens<select id="auFish">
+            <option value="0">Off</option><option value="0.18">Subtle (some close / low shots)</option><option value="0.32">Strong</option>
+          </select></label>
+          <label>⏱ Extend<select id="auExtend">
+            <option value="0">Off (keep length)</option><option value="x1.5">×1.5 longer</option><option value="x2">×2 longer</option>
+            <option value="t30">30 s</option><option value="t60">60 s</option>
+          </select></label>
+        </div>
+        <label>Slow motion quality<select id="auSlow">
+          <option value="smooth">Smooth — new in-between frames (slower export)</option>
+          <option value="fast">Fast — frame blending</option>
+        </select></label>
+        <p class="muted small">Extend uses only your footage: slow motion on the sharpest, steadiest moments, boomerang loops, and replays of the best moments from another angle.</p>
         <p class="muted small">🎯 Tip: Clip tab → <b>Set focus</b>, tap her on the preview, and every crop/zoom follows that spot.</p>
         <p class="muted small">Analysis runs at low resolution on-device. Color/zoom preview live; denoise, sharpen, stabilize and crossfades are applied in the exported MP4. For the cloud upscaler, use AI ✨ → Enhance after exporting.</p>
       </details>
@@ -146,6 +162,16 @@
             <option value="pull">Pull back</option><option value="pan">Pan</option><option value="tilt">Tilt</option>
           </select></label>
           <label class="chk"><input type="checkbox" id="ciFlip"> Mirror (alt angle)</label>
+          <label>Camera height<select id="ciAngle">
+            <option value="none">Eye level</option><option value="high">From above (looking down)</option><option value="low">From below (looking up)</option>
+          </select></label>
+          <label>Tilt / lens<select id="ciLens">
+            <option value="none">Straight</option><option value="dutch">Dutch tilt</option><option value="fish">Fisheye</option><option value="both">Dutch + fisheye</option>
+          </select></label>
+          <label>Speed<select id="ciSpeed">
+            <option value="1">Normal</option><option value="0.75">Slow 0.75×</option><option value="0.5">Slow-mo 0.5×</option><option value="0.33">Super slow 0.33×</option>
+          </select></label>
+          <label class="chk"><input type="checkbox" id="ciBoom"> 🔁 Boomerang (forward, then back)</label>
         </div>
         <div class="btnrow">
           <button id="ciFocus">🎯 Set focus</button>

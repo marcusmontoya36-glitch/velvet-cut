@@ -1,8 +1,8 @@
 // Offline cache for the app shell + ffmpeg engine. User media never goes through here (blob: URLs).
 // The 31 MB ffmpeg core lives in its own cache bucket (vc-core-v1) so app updates don't re-download it.
-const V = 'vc-v5';
+const V = 'vc-v6';
 const CORE = 'vc-core-v1';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'render.js', 'exporter.js', 'ai.js', 'autoedit.js', 'hooks.js', 'manifest.webmanifest',
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'render.js', 'fx.js', 'exporter.js', 'ai.js', 'autoedit.js', 'hooks.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'vendor/blank.mp4', 'vendor/ffmpeg/index.js', 'vendor/ffmpeg/classes.js', 'vendor/ffmpeg/const.js',
   'vendor/ffmpeg/errors.js', 'vendor/ffmpeg/types.js', 'vendor/ffmpeg/utils.js', 'vendor/ffmpeg/worker.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });

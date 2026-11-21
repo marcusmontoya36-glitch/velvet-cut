@@ -1,6 +1,7 @@
 // Export engines: (1) ffmpeg.wasm (single-thread, no special headers needed), (2) real-time canvas + MediaRecorder.
 import { FFmpeg } from './vendor/ffmpeg/index.js';
-import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations } from './render.js';
+import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish } from './render.js';
+import { createFx } from './fx.js';
 
 let ff = null;
 const abs = (p) => new URL(p, location.href).href;
@@ -25,7 +26,7 @@ async function warmCore(onP) {
   } catch (e) { console.warn('core warm-up failed', e); }
 }
 export async function preloadEngine(onP) { await warmCore(onP); }
-async function getFF(onLog, onStage) {
+export async function getFF(onLog, onStage) {
   if (!ff) {
     await warmCore(onStage && ((g, t) => onStage(`Loading engine… ${(g / 1048576).toFixed(0)} of ${(t / 1048576).toFixed(0)} MB (one time)`)));
     onStage && onStage('Starting engine…');
@@ -159,7 +160,7 @@ export function createRealtimeExport(proj, media, opts) {
   const clips = proj.clips;
   const [W, H] = outputSize(clips, opts.res);
   const X = xfadeDurations(clips, proj.xfade || 0);
-  const total = clips.reduce((a, c) => a + (c.out - c.in), 0) - X.reduce((a, b) => a + b, 0);
+  const total = clips.reduce((a, c) => a + clipDur(c), 0) - X.reduce((a, b) => a + b, 0);
   const black = proj.xfadeType === 'black';
   // two players so the next shot can start under the outgoing one (crossfade)
   const mk = () => {
@@ -195,29 +196,50 @@ export function createRealtimeExport(proj, media, opts) {
     rec.ondataavailable = e => e.data && e.data.size && chunks.push(e.data);
     const stopped = new Promise(r => rec.onstop = r);
     const caps = opts.burnCaptions ? proj.captions : [];
-    const drawClip = (v, c, alpha) => {
-      if (!v.videoWidth || alpha <= 0) return;
+    // WebGL draws every shot with the full camera look (crop, high/low angle, dutch tilt, fisheye, mirror)
+    let fx = null;
+    try { const gc = document.createElement('canvas'); gc.width = W; gc.height = H; fx = createFx(gc); } catch (e) { console.warn('WebGL unavailable, angles/fisheye skipped in real-time export', e); }
+    // boomerang: frames captured on the way forward are drawn backwards
+    const caches = new Map();
+    const capture = (v, c) => {
+      if (!c.boom || !v.videoWidth) return;
+      let arr = caches.get(c.id); if (!arr) caches.set(c.id, arr = []);
+      const t = v.currentTime; if (arr.length && t <= arr[arr.length - 1].t + 0.02) return;
+      const cw = Math.min(800, v.videoWidth), ch = Math.round(cw * v.videoHeight / v.videoWidth);
+      const cv2 = document.createElement('canvas'); cv2.width = cw; cv2.height = ch; cv2.getContext('2d').drawImage(v, 0, 0, cw, ch);
+      arr.push({ t, cv: cv2 });
+    };
+    const frameAt = (c, t) => { const arr = caches.get(c.id) || []; let b = arr[0]; for (const f of arr) if (Math.abs(f.t - t) < Math.abs(b.t - t)) b = f; return b?.cv; };
+    const localOf = (v, c) => (Math.min(v.currentTime, c.out) - c.in) / clipSpeed(c);
+    const drawClip = (src, c, alpha, l) => {
+      const sw = src.videoWidth || src.width, sh = src.videoHeight || src.height;
+      if (!sw || alpha <= 0) return;
+      const p = camP(c, l);
       ctx.save();
       ctx.globalAlpha = alpha;
       if (hasFilter) ctx.filter = cssFilter(clipColor(proj, c));
-      if (c.cam?.flip) { ctx.translate(W, 0); ctx.scale(-1, 1); }
-      const p = (Math.min(v.currentTime, c.out) - c.in) / Math.max(0.01, c.out - c.in);
-      const { z, cx, cy } = camAt(c.cam || null, p);
-      const [dx, dy, dw, dh] = containRect(v.videoWidth, v.videoHeight, W, H);
-      if (z > 1.0005) { const sw = W / z, sh = H / z, sx = cx * W - sw / 2, sy = cy * H - sh / 2, k = W / sw; ctx.drawImage(v, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k); }
-      else ctx.drawImage(v, dx, dy, dw, dh);
+      if (fx && fx.draw(src, sw, sh, c.cam || null, p)) ctx.drawImage(fx.canvas, 0, 0, W, H);
+      else {
+        if (c.cam?.flip) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+        const { z, cx, cy } = camAt(c.cam || null, p);
+        const [dx, dy, dw, dh] = containRect(sw, sh, W, H);
+        if (z > 1.0005) { const ww = W / z, hh = H / z, sx = cx * W - ww / 2, sy = cy * H - hh / 2, k = W / ww; ctx.drawImage(src, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k); }
+        else ctx.drawImage(src, dx, dy, dw, dh);
+      }
       ctx.restore();
     };
     const prep = async (v, c) => {
       const url = media.get(c.mediaId).url;
       if (v.src !== url) { v.src = url; await once(v, 'loadedmetadata').catch(() => {}); }
+      v.playbackRate = clipSpeed(c);
       await seekTo(v, c.in);
     };
     let offset = 0, started = false, nextStarted = false;
     await prep(vids[0], clips[0]);
     for (let i = 0; i < clips.length && !cancelled; i++) {
       const c = clips[i], cur = vids[i % 2], nxt = vids[(i + 1) % 2], n = clips[i + 1];
-      const Xi = X[i] || 0, vol = c.muted ? 0 : 1;
+      const Xi = X[i] || 0, vol = c.muted ? 0 : 1, D = clipDur(c), F = fwdDur(c);
+      cur.playbackRate = clipSpeed(c);
       if (!nextStarted) {
         if (!started) { rec.start(1000); started = true; } else if (rec.state === 'paused') rec.resume();
         await cur.play();
@@ -226,33 +248,46 @@ export function createRealtimeExport(proj, media, opts) {
       // get the following shot ready (seeked, paused) while this one plays
       let nextReady = false;
       const nextPrep = n ? prep(nxt, n).then(() => { nextReady = true; }).catch(() => {}) : null;
+      let rev = null; // boomerang reverse phase: performance.now() when it started
+      let l = 0;
       await new Promise(res => {
         let done = false;
-        const finish = () => { if (done) return; done = true; clearInterval(iv); cur.removeEventListener('ended', finish); res(); };
+        const finish = () => { if (done) return; done = true; clearInterval(iv); res(); };
         const tick = () => {
           if (done) return;
           if (cancelled) return finish();
-          const rem = c.out - cur.currentTime;
-          if (n && Xi > 0 && rem <= Xi && !nextStarted && nextReady) { nextStarted = true; nxt.play().catch(() => {}); }
+          if (rev == null) {
+            l = localOf(cur, c);
+            if (c.boom && (cur.currentTime >= c.out - 0.02 || cur.ended)) { capture(cur, c); cur.pause(); rev = performance.now() - Math.max(0, l - F) * 1000; }
+          }
+          if (rev != null) l = F + (performance.now() - rev) / 1000;
+          const rem = D - l;
+          if (n && Xi > 0 && rem <= Xi && !nextStarted && nextReady) { nextStarted = true; nxt.playbackRate = clipSpeed(n); nxt.play().catch(() => {}); }
           const a = nextStarted ? Math.max(0, Math.min(1, 1 - rem / Xi)) : 0;
           ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-          if (black) { drawClip(cur, c, a < 0.5 ? 1 - 2 * a : 0); if (nextStarted) drawClip(nxt, n, a > 0.5 ? 2 * a - 1 : 0); }
-          else { drawClip(cur, c, 1); if (nextStarted) drawClip(nxt, n, a); }
+          if (rev == null) capture(cur, c);
+          const curSrc = rev != null ? frameAt(c, srcAt(c, l)) : cur;
+          const ln = nextStarted ? localOf(nxt, n) : 0;
+          if (nextStarted) capture(nxt, n);
+          if (curSrc) {
+            if (black) { drawClip(curSrc, c, a < 0.5 ? 1 - 2 * a : 0, l); if (nextStarted) drawClip(nxt, n, a > 0.5 ? 2 * a - 1 : 0, ln); }
+            else { drawClip(curSrc, c, 1, l); if (nextStarted) drawClip(nxt, n, a, ln); }
+          }
           if (warm) { ctx.globalCompositeOperation = 'soft-light'; ctx.fillStyle = warm; ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
-          const gt = offset + (Math.min(cur.currentTime, c.out) - c.in);
+          const gt = offset + l;
           for (const cp of caps) if (gt >= cp.start && gt < cp.end) drawCaption(ctx, cp, W, H);
-          gains[i % 2].gain.value = vol * (1 - a);
+          gains[i % 2].gain.value = rev != null ? 0 : vol * (1 - a);
           if (nextStarted) gains[(i + 1) % 2].gain.value = (n.muted ? 0 : 1) * a;
           onProgress(Math.min(0.99, gt / total), `Recording ${Math.round(gt)}/${Math.round(total)} s (real-time)…`);
-          if (cur.currentTime >= c.out - 0.02 || cur.ended) return finish();
+          if (l >= D - 0.02 || (!c.boom && (cur.currentTime >= c.out - 0.02 || cur.ended))) return finish();
           requestAnimationFrame(tick);
         };
-        cur.addEventListener('ended', finish);
-        const iv = setInterval(() => { if (cur.currentTime >= c.out - 0.02 || cur.ended || cancelled) finish(); }, 100);
+        // rAF stalls in background tabs: the interval keeps the clock moving
+        const iv = setInterval(() => { if (cancelled) finish(); else if (!c.boom && (cur.currentTime >= c.out - 0.02 || cur.ended)) finish(); }, 100);
         tick();
       });
-      cur.pause(); gains[i % 2].gain.value = 0;
-      offset += (c.out - c.in) - (nextStarted ? Math.max(0, nxt.currentTime - n.in) : 0);
+      cur.pause(); gains[i % 2].gain.value = 0; caches.delete(c.id);
+      offset += D - (nextStarted ? Math.max(0, localOf(nxt, n)) : 0);
       if (n && !nextStarted) { // no crossfade (or next wasn't ready): pause recording while it loads
         if (rec.state === 'recording') rec.pause();
         await nextPrep;
@@ -315,7 +350,7 @@ export async function exportChunked(proj, media, opts) {
   const clips = proj.clips;
   if (!clips.length) throw new Error('Timeline is empty');
   const FPS = 30, q = (x) => Math.round(x * FPS) / FPS;
-  const d = clips.map(c => Math.max(2 / FPS, q(c.out - c.in)));
+  const d = clips.map(c => Math.max(2 / FPS, q(clipDur(c))));
   const xf = +proj.xfade || 0;
   const X = xfadeDurations(clips, xf, FPS);
   const xfType = proj.xfadeType === 'black' ? 'fadeblack' : 'fade';
@@ -335,32 +370,64 @@ export async function exportChunked(proj, media, opts) {
   const list = ids.map(id => { const m = media.get(id); if (!m) throw new Error('Missing media for a clip — re-import it.'); return { id, ...m }; });
   onProgress(0, 'Opening sources…');
   const { paths, mounted } = await mountSources(f, list);
-  const hasAudio = new Map();
+  const hasAudio = new Map(), srcFps = new Map();
   for (const id of ids) {
     collecting = [];
     try { await f.exec(['-hide_banner', '-i', paths.get(id)]); } catch {}
     hasAudio.set(id, collecting.some(l => /Stream #.*Audio:/.test(l)));
+    const vl = collecting.find(l => /Stream #.*Video:/.test(l)) || '';
+    srcFps.set(id, +(/([\d.]+) fps/.exec(vl)?.[1] || /([\d.]+) tbr/.exec(vl)?.[1] || 30));
     collecting = null;
   }
+  // source window to read for timeline portion [start, start+len] of a clip -> ['-ss', a, '-t', b]
+  const srcWin = (c, start, len) => {
+    if (c.boom) return ['-ss', c.in.toFixed(3), '-t', (c.out - c.in + 0.3).toFixed(3)];
+    const sp = clipSpeed(c);
+    return ['-ss', (c.in + start * sp).toFixed(3), '-t', (len * sp + 0.5).toFixed(3)];
+  };
+  const slowMode = proj.slowmo || 'smooth';
   // captions (preview-timeline times)
   const caps = opts.burnCaptions ? (proj.captions || []).filter(c => c.text && c.end > c.start) : [];
   for (let j = 0; j < caps.length; j++) await f.writeFile(`cap${j}.png`, await captionPng(caps[j], W, H));
 
   // video+audio chain for one portion of a clip -> labels
+  // boomerangs: the forward part is rendered with the camera, then reversed (reads exactly like the preview)
   const chain = (fc, inIdx, c, start, len, tag) => {
     const N = Math.round(len * FPS);
+    const sp = clipSpeed(c), boom = !!c.boom;
+    const interp = sp < 0.999 && srcFps.get(c.mediaId) * sp < 29; // slow motion that needs new in-between frames
     const cam = c.cam && (c.cam.z0 > 1.001 || c.cam.z1 > 1.001) ? c.cam : null;
-    const k = cam && !c.enh?.stab ? Math.min(2, Math.max(1, Math.min(c.w || W, c.h || H) / Math.min(W, H))) : 1;
+    let k = cam && !c.enh?.stab ? Math.min(2, Math.max(1, Math.min(c.w || W, c.h || H) / Math.min(W, H))) : 1;
+    if (interp && slowMode === 'smooth') k = 1; // motion interpolation is the slow part: run it at output size
     const NW = Math.round(W * k / 2) * 2, NH = Math.round(H * k / 2) * 2;
-    const v = [`[${inIdx}:v]setpts=PTS-STARTPTS`, `fps=${FPS}`, `scale=${NW}:${NH}:force_original_aspect_ratio=decrease`, `pad=${NW}:${NH}:(ow-iw)/2:(oh-ih)/2:black`, 'setsar=1'];
+    const v = [`[${inIdx}:v]setpts=PTS-STARTPTS`];
+    if (sp < 0.999) v.push(`setpts=PTS/${sp.toFixed(4)}`);
+    if (!interp) v.push(`fps=${FPS}`);
+    v.push(`scale=${NW}:${NH}:force_original_aspect_ratio=decrease`, `pad=${NW}:${NH}:(ow-iw)/2:(oh-ih)/2:black`, 'setsar=1');
+    if (interp) v.push(slowMode === 'smooth' ? `minterpolate=fps=${FPS}:mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=epzs:search_param=16` : `framerate=fps=${FPS}`, `fps=${FPS}`);
     if (c.enh?.stab) v.push('deshake=rx=32:ry=32:edge=mirror');
-    if (cam) v.push(camFF(cam, d[clips.indexOf(c)], start, W, H, FPS)); else if (NW !== W) v.push(`scale=${W}:${H}`);
+    const F = fwdDur(c);
+    if (cam) v.push(camFF(cam, boom ? F : d[clips.indexOf(c)], boom ? 0 : start, W, H, FPS)); else if (NW !== W) v.push(`scale=${W}:${H}`);
+    const wf = c.cam ? warpFF(c.cam, W, H) : ''; if (wf) v.push(wf);
     if (c.cam?.flip) v.push('hflip');
     const en = enhFF(proj, c); if (en) v.push(en);
-    v.push('setsar=1', 'format=yuv420p', `tpad=stop_mode=clone:stop_duration=1`, `trim=end_frame=${N}`, 'setpts=PTS-STARTPTS');
-    fc.push(v.join(',') + `[v${tag}]`);
-    if (hasAudio.get(c.mediaId) && !c.muted) fc.push(`[${inIdx}:a]asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${(N / FPS).toFixed(4)}[a${tag}]`);
-    else fc.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${(N / FPS).toFixed(4)}[a${tag}]`);
+    if (boom) {
+      const Nf = Math.max(2, Math.round(F * FPS)), s0 = Math.round(start * FPS);
+      v.push('setsar=1', 'format=yuv420p', 'tpad=stop_mode=clone:stop_duration=1', `trim=end_frame=${Nf}`, 'setpts=PTS-STARTPTS', 'split');
+      fc.push(v.join(',') + `[f${tag}][g${tag}]`, `[g${tag}]reverse[r${tag}]`,
+        `[f${tag}][r${tag}]concat=n=2:v=1:a=0,trim=start_frame=${s0}:end_frame=${s0 + N},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration=1,trim=end_frame=${N},setpts=PTS-STARTPTS,fps=${FPS},settb=1/${FPS}[v${tag}]`);
+    } else {
+      v.push('setsar=1', 'format=yuv420p', `tpad=stop_mode=clone:stop_duration=1`, `trim=end_frame=${N}`, 'setpts=PTS-STARTPTS', `settb=1/${FPS}`);
+      fc.push(v.join(',') + `[v${tag}]`);
+    }
+    const ad = (N / FPS).toFixed(4);
+    if (hasAudio.get(c.mediaId) && !c.muted) {
+      const a = [`[${inIdx}:a]asetpts=PTS-STARTPTS`, 'aresample=44100', 'aformat=sample_fmts=fltp:channel_layouts=stereo'];
+      if (sp < 0.999) a.push(`atempo=${Math.max(0.5, sp).toFixed(4)}`);
+      if (boom) a.push(`atrim=duration=${F.toFixed(4)}`, `afade=t=out:st=${Math.max(0, F - 0.15).toFixed(3)}:d=0.15`, 'apad', `atrim=start=${start.toFixed(4)}:duration=${ad}`, 'asetpts=PTS-STARTPTS');
+      else a.push('apad', `atrim=duration=${ad}`);
+      fc.push(a.join(',') + `[a${tag}]`);
+    } else fc.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=duration=${ad}[a${tag}]`);
   };
   const addCaps = (fc, args, nInputs, vlab, G, len) => {
     let last = vlab, n = nInputs;
@@ -394,7 +461,7 @@ export async function exportChunked(proj, media, opts) {
       stage = `Encoding shot ${i + 1} of ${clips.length}…`;
       onProgress(Math.min(0.97, pieceBase / outTotal * 0.97), stage);
       if (len >= 1 / FPS) {
-        const args = ['-hide_banner', '-nostdin', '-ss', (c.in + s0).toFixed(3), '-t', (len + 0.5).toFixed(3), '-i', paths.get(c.mediaId)];
+        const args = ['-hide_banner', '-nostdin', ...srcWin(c, s0, len), '-i', paths.get(c.mediaId)];
         const fc = []; chain(fc, 0, c, s0, len, 'b');
         const vl = addCaps(fc, args, 1, 'vb', P[i] + s0, len);
         await runPiece(args, fc, vl, 'ab', `p${pieces.length}.mkv`, len);
@@ -402,8 +469,8 @@ export async function exportChunked(proj, media, opts) {
       if (s1 > 0) { // crossfade into next shot
         const n = clips[i + 1];
         const args = ['-hide_banner', '-nostdin',
-          '-ss', (c.in + d[i] - s1).toFixed(3), '-t', (s1 + 0.5).toFixed(3), '-i', paths.get(c.mediaId),
-          '-ss', n.in.toFixed(3), '-t', (s1 + 0.5).toFixed(3), '-i', paths.get(n.mediaId)];
+          ...srcWin(c, d[i] - s1, s1), '-i', paths.get(c.mediaId),
+          ...srcWin(n, 0, s1), '-i', paths.get(n.mediaId)];
         const fc = [];
         chain(fc, 0, c, d[i] - s1, s1, 'x'); chain(fc, 1, n, 0, s1, 'y');
         fc.push(`[vx][vy]xfade=transition=${xfType}:duration=${s1.toFixed(4)}:offset=0[vt]`, `[ax][ay]acrossfade=d=${s1.toFixed(4)}[at]`);

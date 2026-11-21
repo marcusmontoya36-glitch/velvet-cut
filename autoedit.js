@@ -15,6 +15,11 @@ export const AUTO_DEFAULTS = {
   strict: 'normal',      // loose | normal | strict
   color: true, denoise: true, sharpen: true, stabilize: true,
   camera: true, camLevel: 2, altAngle: false, // camLevel 1 subtle, 2 medium, 3 bold
+  angles: true,          // simulated high (from above) / low (from below) angles mixed into the rotation
+  dutch: true,           // slight dutch tilt on some of the angled shots
+  fish: '0.18',          // fisheye lens on some close / low shots: '0' off | '0.18' subtle | '0.32' strong
+  extend: '0',           // '0' off | 'x1.5' | 'x2' | 't30' | 't60' (target seconds)
+  slowmo: 'smooth',      // smooth = motion-interpolated slow motion at export | fast = frame blend
 };
 export function loadAutoSettings() {
   try { return { ...AUTO_DEFAULTS, ...JSON.parse(localStorage.getItem('vc.auto2') || '{}') }; } catch { return { ...AUTO_DEFAULTS }; }
@@ -423,9 +428,9 @@ export function enhanceFor(samples, settings) {
 // ---------- Dynamic camera ----------
 // zMed/zClose/zPunch are crop factors (1.4 = 1/1.4 of the frame), push = relative zoom change over a shot.
 export const LEVELS = {
-  1: { zMed: 1.22, zClose: 1.45, zPunch: 1.6, push: 0.16, pan: 0.05, split: 4.5 },
-  2: { zMed: 1.4, zClose: 1.7, zPunch: 1.9, push: 0.25, pan: 0.08, split: 3 },
-  3: { zMed: 1.55, zClose: 1.9, zPunch: 2.2, push: 0.32, pan: 0.1, split: 2.2 },
+  1: { zMed: 1.22, zClose: 1.45, zPunch: 1.6, push: 0.16, pan: 0.05, split: 4.5, ks: 0.16, roll: 2.5 },
+  2: { zMed: 1.4, zClose: 1.7, zPunch: 1.9, push: 0.25, pan: 0.08, split: 3, ks: 0.26, roll: 4 },
+  3: { zMed: 1.55, zClose: 1.9, zPunch: 2.2, push: 0.32, pan: 0.1, split: 2.2, ks: 0.32, roll: 6 },
 };
 export function subjectOf(samples, a, b) {
   if (!samples?.length) return { cx: 0.5, cy: 0.5 };
@@ -471,7 +476,7 @@ export function planCamera(shots, level, opts = {}) {
   const out = [];
   for (const s of shots) {
     const len = s.out - s.in;
-    if (len > L.split) {
+    if (len > L.split && !s.boom) {
       const parts = len >= L.split * 2.2 ? 3 : 2;
       const cuts = [];
       for (let p = 1; p < parts; p++) {
@@ -491,28 +496,46 @@ export function planCamera(shots, level, opts = {}) {
   }
   // framing sequence: mostly medium/close moves; wide at most 1 in 10 here (spec: <= 1 in 5)
   const seq = ['push', 'punch', 'pan', 'close', 'pull', 'medium', 'tilt', 'punch', 'wide', 'close'];
-  let k = 0, prev = null, n = 0;
+  let k = 0, prev = null, n = 0, nAng = 0, nLow = 0, prevFish = false;
+  const fishK = +opts.fish || 0;
   for (const s of out) {
-    let type = seq[k++ % seq.length];
+    let type = s.camType || seq[k++ % seq.length];
     // alternate tight / loose on every cut, never repeat
-    if (prev && (type === prev || TIGHT.has(type) === TIGHT.has(prev))) {
+    if (!s.camType && prev && (type === prev || TIGHT.has(type) === TIGHT.has(prev))) {
       const want = !TIGHT.has(prev);
       for (let j = 0; j < seq.length; j++) { const t2 = seq[(k + j) % seq.length]; if (TIGHT.has(t2) === want && t2 !== prev && t2 !== 'wide') { type = t2; break; } }
     }
     prev = type;
     const subj = (opts.subjFn && opts.subjFn(s, s.in, s.out)) || subjectOf(s.samples || [], s.in, s.out);
-    const flip = !!opts.altAngle && type !== 'wide' && n % 4 === 3;
-    s.cam = camFor(type, subj, L, flip);
+    const flip = s.flipAngle ?? (!!opts.altAngle && type !== 'wide' && n % 4 === 3);
+    // camera height: every 3rd shot is seen from above or below (alternating); replays ask for one explicitly
+    const look = {};
+    let ang = s.wantAngle ?? (opts.angles && type !== 'wide' && n % 3 === 1 ? (nAng++ % 2 === 0 ? 'high' : 'low') : null);
+    if (ang === 'none') ang = null;
+    if (ang && (opts.angles !== false || s.wantAngle)) { look.angle = ang; look.ks = L.ks; if (opts.dutch && (ang === 'low' || nAng % 3 === 0)) look.roll = (n % 2 ? -1 : 1) * L.roll; }
+    // fisheye: on every other low angle and now and then on a close / punch, never twice in a row
+    if (fishK > 0 && type !== 'wide' && !prevFish && (s.wantFish || (ang === 'low' && nLow++ % 2 === 0) || (!ang && (type === 'close' || type === 'punch') && n % 5 === 3))) look.fish = fishK;
+    prevFish = !!look.fish;
+    s.cam = camFor(type, subj, L, flip, look);
+    delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType;
     n++;
   }
   return out;
 }
-export function camFor(type, subj, L, flip = false) {
+/** look = { angle: 'high'|'low', ks, roll, fish } (optional) */
+export function camFor(type, subj, L, flip = false, look = {}) {
   const cx = subj.cx, cy = subj.cy, cx1 = subj.cx1 ?? cx, cy1 = subj.cy1 ?? cy;
+  const ang = look?.angle;
+  // seen from above the camera tilts down through the shot; from below it tilts up
+  const tdy = ang === 'high' ? L.pan * 0.5 : ang === 'low' ? -L.pan * 0.5 : 0;
   const mk = (z0, z1, x0, y0, x1, y1) => {
-    const [a, b] = clampCenter(x0, y0, z0), [c, d] = clampCenter(x1, y1, z1);
+    if (ang || look?.fish) { z0 = Math.max(1.15, z0); z1 = Math.max(1.15, z1); }
+    const [a, b] = clampCenter(x0, y0 - tdy, z0), [c, d] = clampCenter(x1, y1 + tdy, z1);
     const o = { type, z0: +z0.toFixed(3), z1: +z1.toFixed(3), x0: +a.toFixed(3), y0: +b.toFixed(3), x1: +c.toFixed(3), y1: +d.toFixed(3) };
     if (flip) o.flip = true;
+    if (ang) { o.angle = ang; o.ks = +(look.ks || L.ks || 0.18).toFixed(3); }
+    if (look?.roll) o.roll = +look.roll.toFixed(2);
+    if (look?.fish) o.fish = +look.fish.toFixed(3);
     return o;
   };
   const mx = (cx + cx1) / 2, my = (cy + cy1) / 2;
@@ -528,6 +551,7 @@ export function camFor(type, subj, L, flip = false) {
   }
   return null;
 }
+export const lookOf = (cam) => cam ? { angle: cam.angle, ks: cam.ks, roll: cam.roll, fish: cam.fish } : {};
 export const CAM_TYPES = ['wide', 'medium', 'close', 'punch', 'push', 'pull', 'pan', 'tilt'];
 
 // ---------- focus tracking (tap a point, follow it through the clip) ----------
@@ -613,3 +637,98 @@ async function playFrames(v, t0, t1, step, onFrame, signal, rate = 8) {
 
 export function parseXf(v) { v = String(v ?? '0'); return { xfade: parseFloat(v.replace('b', '')) || 0, xfadeType: v.startsWith('b') ? 'black' : 'fade' }; }
 export const xfValue = (proj) => !proj.xfade ? '0' : (proj.xfadeType === 'black' ? 'b' : '') + proj.xfade;
+
+// ---------------- Extend: make the edit longer using only the existing footage ----------------
+// Three tools, all from the real clips (no generated frames):
+//  slow  - the sharpest / steadiest stretch of a shot is played in slow motion (frames interpolated at export)
+//  boom  - a best moment is played forward then backward (boomerang) as an extra shot
+//  replay - a best moment is shown again later from another "camera": above / below / mirrored / fisheye
+export function parseExtend(v) {
+  v = String(v || '0');
+  if (v.startsWith('x')) return { mul: +v.slice(1) || 1 };
+  if (v.startsWith('t')) return { target: +v.slice(1) || 0 };
+  return null;
+}
+export function editLength(shots, X) {
+  const d = shots.map(s => (s.out - s.in) / (s.speed || 1) * (s.boom ? 2 : 1));
+  let t = d.reduce((a, b) => a + b, 0);
+  for (let j = 0; j < d.length - 1; j++) { const x = Math.min(X || 0, d[j] / 3, d[j + 1] / 3); if (x >= 0.1) t -= x; }
+  return t;
+}
+export function extendShots(shots, setting, { xfade = 0, lapRef = 50 } = {}) {
+  const ex = parseExtend(setting);
+  const base = editLength(shots, xfade);
+  if (!ex || !shots.length) return { shots, base, length: base, target: base, ops: [] };
+  const target = ex.mul ? base * ex.mul : Math.max(base, ex.target);
+  let out = shots.map(s => ({ ...s }));
+  const used = new Map(); // mediaId -> [[a,b]] windows already slowed / reused
+  let reuse = false; // once fresh footage runs out, best moments may be shown again (penalised so they rotate)
+  const overlaps = (s, a, b) => (used.get(s.mediaId) || []).filter(([x, y]) => a < y - 0.05 && b > x + 0.05).length;
+  const free = (s, a, b) => reuse || !overlaps(s, a, b);
+  const mark = (s, a, b) => { if (!used.has(s.mediaId)) used.set(s.mediaId, []); used.get(s.mediaId).push([a, b]); };
+  // best free window of length w inside a (non-extended) shot: mean quality, bad samples excluded
+  const best = (w) => {
+    let top = null;
+    for (const s of out) {
+      if (s.boom || s.replay || s.out - s.in < w + 0.05) continue;
+      const ss = (s.samples || []).filter(x => x.t >= s.in && x.t <= s.out);
+      for (let a = s.in; a + w <= s.out + 1e-6; a += 0.25) {
+        const b = a + w;
+        if (!free(s, a, b)) continue;
+        const win = ss.filter(x => x.t >= a - 0.1 && x.t <= b + 0.1);
+        let sc = win.length ? win.reduce((m, x) => m + (x.bad?.length && !x.soft ? -1 : quality(x, lapRef)), 0) / win.length : (s.score || 0.4);
+        if (reuse) sc -= 0.25 * overlaps(s, a, b);
+        if (!top || sc > top.sc) top = { s, a: r2(a), b: r2(b), sc };
+      }
+    }
+    return top;
+  };
+  const ops = [];
+  const kinds = ['slow', 'boom', 'replay'];
+  // where to put an extra shot: from position p on, the first gap whose neighbours aren't extra shots themselves
+  const place = (p) => {
+    for (let q = p; q <= out.length; q++) if (!out[q - 1]?.extra && !out[q]?.extra) return q;
+    for (let q = p; q <= out.length; q++) if (out[q - 1]?.ext !== out[q]?.ext || !out[q - 1]?.extra) return q; // at least not two of a kind
+    return Math.min(p, out.length);
+  };
+  let angleFlip = 0;
+  for (let it = 0; it < 40; it++) {
+    const len = editLength(out, xfade), need = target - len;
+    if (need < 0.3) break;
+    let done = false;
+    for (let tries = 0; tries < 3 && !done; tries++) {
+      const kind = kinds[(it + tries) % 3];
+      if (kind === 'slow') {
+        if (reuse) continue; // slowing the same stretch twice adds nothing
+        const w = clamp(need, 1, 2.4), c = best(w); if (!c) continue;
+        // slow the window in place: [in,a] normal, [a,b] at half speed, [b,out] normal (tiny leftovers are absorbed)
+        const s = c.s, i = out.indexOf(s);
+        let a = c.a, b = c.b; if (a - s.in < 0.8) a = s.in; if (s.out - b < 0.8) b = s.out;
+        const parts = [];
+        // overlaps so each crossfade blends the same moment (outgoing normal speed, incoming slow, and back)
+        if (a > s.in) parts.push({ ...s, out: a });
+        parts.push({ ...s, in: a > s.in ? r2(Math.max(s.in, a - xfade)) : a, out: b, speed: 0.5, ext: 'slow' });
+        if (b < s.out) parts.push({ ...s, in: r2(Math.max(s.in, b - xfade / 2)) });
+        out.splice(i, 1, ...parts); mark(s, a, b); ops.push({ kind, name: s.name, in: a, out: b, adds: +(b - a).toFixed(2) });
+        done = true;
+      } else if (kind === 'boom') {
+        const f = clamp((need + xfade) / 2, 0.6, 1.2), c = best(f); if (!c) continue;
+        const i = out.indexOf(c.s);
+        out.splice(place(i + 1), 0, { ...c.s, in: c.a, out: c.b, speed: 0, boom: true, ext: 'boom', extra: true, score: c.sc });
+        mark(c.s, c.a, c.b); ops.push({ kind, name: c.s.name, in: c.a, out: c.b, adds: +(2 * (c.b - c.a) - xfade).toFixed(2) });
+        done = true;
+      } else {
+        const w = clamp(need + xfade, 1.5, 3), c = best(w); if (!c) continue;
+        const i = out.indexOf(c.s), at = place(Math.min(out.length, i + 3));
+        const k = angleFlip++;
+        out.splice(at, 0, { ...c.s, in: c.a, out: c.b, speed: 0, replay: true, ext: 'replay', extra: true, score: c.sc,
+          wantAngle: k % 2 ? 'low' : 'high', flipAngle: k % 2 === 0, wantFish: k % 3 === 1, camType: k % 2 ? 'close' : 'medium' });
+        mark(c.s, c.a, c.b); ops.push({ kind, name: c.s.name, in: c.a, out: c.b, adds: +(c.b - c.a - xfade).toFixed(2) });
+        done = true;
+      }
+    }
+    if (!done) { if (reuse) break; reuse = true; } // no fresh footage left: allow reuse once, then stop
+  }
+  out.forEach(s => delete s.extra);
+  return { shots: out, base, length: editLength(out, xfade), target, ops };
+}

@@ -37,13 +37,17 @@ Tap **⚡ Auto Edit**, pick one or more videos, and the app edits them on the de
    shaky (erratic global motion between frames), frozen/static, too short, or near-duplicates get cut. Every cut is listed
    with its reasons and a thumbnail, and **↩ Restore** puts it back. Sensitivity can be Loose, Normal or Strict.
 3. **Arrange.** Shots are split at scene changes, then ordered by capture time (MP4/MOV `mvhd` date), by file order, or
-   best shots first. Crossfades are optional (0.25 to 0.7 s).
+   best shots first. **Smooth transitions are on by default:** a 0.5 s crossfade (or 0.3 / 0.8 s, dip to black, or hard cuts).
+   The preview blends two video players, so what you see is what gets exported.
 4. **Enhance.** Per-video automatic brightness, contrast and saturation (shown in the preview). Denoise (`hqdn3d`), sharpen (`unsharp`)
    and stabilize (`deshake`, only on slightly shaky kept shots) are applied in the export.
-5. **🎥 Dynamic camera** (toggle plus Subtle/Medium/Bold). Adds Ken Burns push-ins and pull-backs, punch-in cuts (a long shot is split
-   into 2 or 3 "angles"), wide, medium and close framings, and slow pans and tilts. The crop centre comes from motion,
-   skin tone and a centre bias, is median-smoothed per shot, and is clamped so the frame never shows black edges.
-   Framings never repeat back to back. It shows live in the preview and in both export engines.
+5. **🎥 Dynamic camera** (on by default at Medium; Subtle/Medium/Bold). Any shot longer than about 3 s (Medium) is split into 2–3
+   angles at its calmest moments, and the angles overlap by the crossfade so the same moment blends from one framing into the next.
+   Framings alternate tight and loose: push-in, punch-in (1.9×), pan, close (1.7×), pull-back, medium (1.4×), tilt. Wide is at most about 1 in 5.
+   Push-ins and pull-backs change the zoom by 25–35%. The optional mirrored **alt angle** flips every 4th shot. The crop follows the
+   subject from motion plus skin-tone saliency, or a **focus point**: Clip tab → 🎯 Set focus → tap her in the preview. The point is
+   template-tracked through the video and drives every crop and move. You can also pick a framing per clip.
+   No person or gender classification is done. Everything shows live in the preview and in both export engines.
 6. **Export MP4 for iPhone.** Uses the chunked ffmpeg.wasm export: the source files are mounted read-only with WORKERFS (not
    copied into memory), each shot and each crossfade is encoded as a small piece (H.264 yuv420p, 30 fps, capped bitrate), and
    then the pieces are joined. Video is stream-copied, and audio is encoded once to AAC with `+faststart`. The result can be
@@ -59,8 +63,8 @@ downloaded once with a progress readout into its own cache bucket (`vc-core-v1`)
 
 **Limits:** analysis takes about 1.5 s for a 10 s clip on a desktop (8× playback) and depends on the phone. Export speed is
 about 0.5 to 1× real time at 720p on a desktop. On iPhone, keep exports to roughly 5 minutes at 720p (or use 480p). The
-encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color
-and camera moves but not crossfades, denoise or sharpen.
+encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color,
+camera moves and crossfades, but not denoise or sharpen.
 
 ## Features
 
@@ -111,7 +115,7 @@ Nothing is sent unless you press a hook button and confirm the upload dialog.
 - Browser storage can be evicted if the device runs low on space; the app requests persistent storage,
   but keep originals elsewhere. Clearing Safari website data deletes projects.
 - Live dictate needs a microphone and works best in a quiet room.
-- No multi-track (one video track + one text track), no transitions, no audio mixing / music track yet.
+- No multi-track (one video track + one text track), no audio mixing / music track yet.
 
 ## AI enhance (fal.ai — wired)
 **Turn it on:** get a key at [fal.ai/dashboard/keys](https://fal.ai/dashboard/keys) → ⚙️ Settings → Provider **fal.ai** →

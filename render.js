@@ -131,8 +131,15 @@ export function camAt(cam, p) {
 // CSS transform for the preview <video> (element is the stage size; overflow hidden on the stage)
 export function camCss(cam, p) {
   const { z, cx, cy } = camAt(cam, p);
-  if (z <= 1.0005) return '';
-  return `scale(${z.toFixed(4)}) translate(${((0.5 - cx) * 100).toFixed(3)}%, ${((0.5 - cy) * 100).toFixed(3)}%)`;
+  const fl = cam?.flip ? 'scaleX(-1) ' : '';
+  if (z <= 1.0005) return fl;
+  return `${fl}scale(${z.toFixed(4)}) translate(${((0.5 - cx) * 100).toFixed(3)}%, ${((0.5 - cy) * 100).toFixed(3)}%)`;
+}
+// crossfade length at each boundary j (between clip j and j+1), shared by preview, real-time and ffmpeg export
+export function xfadeDurations(clips, xf, fps = 30) {
+  const q = (x) => Math.round(x * fps) / fps;
+  const d = clips.map(c => Math.max(2 / fps, q(c.out - c.in)));
+  return clips.slice(0, -1).map((c, j) => { const x = q(Math.min(xf || 0, d[j] / 3, d[j + 1] / 3)); return x >= 3 / fps ? x : 0; });
 }
 /**
  * ffmpeg filter that applies the camera move on a W×H frame (input already W*k × H*k).

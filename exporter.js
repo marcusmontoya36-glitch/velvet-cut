@@ -1,6 +1,6 @@
 // Export engines: (1) ffmpeg.wasm (single-thread, no special headers needed), (2) real-time canvas + MediaRecorder.
 import { FFmpeg } from './vendor/ffmpeg/index.js';
-import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF } from './render.js';
+import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations } from './render.js';
 
 let ff = null;
 const abs = (p) => new URL(p, location.href).href;
@@ -157,35 +157,36 @@ export function pickRecorderMime() {
 
 export function createRealtimeExport(proj, media, opts) {
   const clips = proj.clips;
-  const total = clips.reduce((a, c) => a + (c.out - c.in), 0);
   const [W, H] = outputSize(clips, opts.res);
-  const v = document.createElement('video');
-  v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto';
-  v.style.cssText = 'position:fixed;left:-10px;top:-10px;width:2px;height:2px;opacity:0.01;pointer-events:none';
-  document.body.appendChild(v);
-  // prime element + audio graph inside the user gesture
-  const first = media.get(clips[0].mediaId);
-  v.src = first.url;
+  const X = xfadeDurations(clips, proj.xfade || 0);
+  const total = clips.reduce((a, c) => a + (c.out - c.in), 0) - X.reduce((a, b) => a + b, 0);
+  const black = proj.xfadeType === 'black';
+  // two players so the next shot can start under the outgoing one (crossfade)
+  const mk = () => {
+    const v = document.createElement('video');
+    v.playsInline = true; v.setAttribute('playsinline', ''); v.preload = 'auto';
+    v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none';
+    document.body.appendChild(v); return v;
+  };
+  const vids = [mk(), mk()];
+  vids[0].src = media.get(clips[0].mediaId).url;
+  vids[1].src = media.get((clips[1] || clips[0]).mediaId).url;
   const AC = window.AudioContext || window.webkitAudioContext;
   const ac = new AC();
   ac.resume();
-  const src = ac.createMediaElementSource(v);
-  const gain = ac.createGain();
   const dest = ac.createMediaStreamDestination();
-  src.connect(gain).connect(dest);
-  gain.gain.value = 0;
-  const primed = v.play().catch(() => {}); // unlock playback while still inside the tap
+  const gains = vids.map(v => { const s = ac.createMediaElementSource(v), g = ac.createGain(); g.gain.value = 0; s.connect(g).connect(dest); return g; });
+  const primed = Promise.all(vids.map(v => v.play().catch(() => {}))); // unlock both inside the tap (iOS)
   let cancelled = false;
 
   async function run() {
     const { onProgress = () => {} } = opts;
-    await primed; v.pause();
+    await primed; vids.forEach(v => v.pause());
     const mime = pickRecorderMime();
     if (mime === null) throw new Error('MediaRecorder not supported in this browser');
     const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
     const ctx = cv.getContext('2d');
     const hasFilter = 'filter' in ctx;
-    let filt = cssFilter(proj.color), cam = null, camP = 0;
     const warm = warmthColor(proj.color.w);
     const vstream = cv.captureStream(30);
     const stream = new MediaStream([...vstream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
@@ -194,62 +195,78 @@ export function createRealtimeExport(proj, media, opts) {
     rec.ondataavailable = e => e.data && e.data.size && chunks.push(e.data);
     const stopped = new Promise(r => rec.onstop = r);
     const caps = opts.burnCaptions ? proj.captions : [];
-    const draw = (gt) => {
-      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-      if (v.videoWidth) {
-        if (hasFilter) ctx.filter = filt;
-        const { z, cx, cy } = camAt(cam, camP);
-        if (z > 1.0005) { // dynamic camera: draw the crop window of the letterboxed frame
-          const [dx, dy, dw, dh] = containRect(v.videoWidth, v.videoHeight, W, H);
-          const sw = W / z, sh = H / z, sx = cx * W - sw / 2, sy = cy * H - sh / 2;
-          const k = W / sw;
-          ctx.drawImage(v, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k);
-        } else ctx.drawImage(v, ...containRect(v.videoWidth, v.videoHeight, W, H));
-        if (hasFilter) ctx.filter = 'none';
-      }
-      if (warm) { ctx.globalCompositeOperation = 'soft-light'; ctx.fillStyle = warm; ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
-      for (const c of caps) if (gt >= c.start && gt < c.end) drawCaption(ctx, c, W, H);
+    const drawClip = (v, c, alpha) => {
+      if (!v.videoWidth || alpha <= 0) return;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      if (hasFilter) ctx.filter = cssFilter(clipColor(proj, c));
+      if (c.cam?.flip) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+      const p = (Math.min(v.currentTime, c.out) - c.in) / Math.max(0.01, c.out - c.in);
+      const { z, cx, cy } = camAt(c.cam || null, p);
+      const [dx, dy, dw, dh] = containRect(v.videoWidth, v.videoHeight, W, H);
+      if (z > 1.0005) { const sw = W / z, sh = H / z, sx = cx * W - sw / 2, sy = cy * H - sh / 2, k = W / sw; ctx.drawImage(v, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k); }
+      else ctx.drawImage(v, dx, dy, dw, dh);
+      ctx.restore();
     };
-    let offset = 0, started = false;
-    for (let i = 0; i < clips.length && !cancelled; i++) {
-      const c = clips[i], m = media.get(c.mediaId);
-      if (v.src !== m.url) v.src = m.url;
+    const prep = async (v, c) => {
+      const url = media.get(c.mediaId).url;
+      if (v.src !== url) { v.src = url; await once(v, 'loadedmetadata').catch(() => {}); }
       await seekTo(v, c.in);
-      filt = cssFilter(clipColor(proj, c)); cam = c.cam || null; camP = 0;
-      gain.gain.value = c.muted ? 0 : 1;
-      draw(offset);
-      if (!started) { rec.start(1000); started = true; } else if (rec.state === 'paused') rec.resume();
-      await v.play();
+    };
+    let offset = 0, started = false, nextStarted = false;
+    await prep(vids[0], clips[0]);
+    for (let i = 0; i < clips.length && !cancelled; i++) {
+      const c = clips[i], cur = vids[i % 2], nxt = vids[(i + 1) % 2], n = clips[i + 1];
+      const Xi = X[i] || 0, vol = c.muted ? 0 : 1;
+      if (!nextStarted) {
+        if (!started) { rec.start(1000); started = true; } else if (rec.state === 'paused') rec.resume();
+        await cur.play();
+      }
+      nextStarted = false;
+      // get the following shot ready (seeked, paused) while this one plays
+      let nextReady = false;
+      const nextPrep = n ? prep(nxt, n).then(() => { nextReady = true; }).catch(() => {}) : null;
       await new Promise(res => {
         let done = false;
-        const finish = () => { if (done) return; done = true; clearInterval(iv); v.removeEventListener('ended', finish); res(); };
+        const finish = () => { if (done) return; done = true; clearInterval(iv); cur.removeEventListener('ended', finish); res(); };
         const tick = () => {
           if (done) return;
           if (cancelled) return finish();
-          const gt = offset + (Math.min(v.currentTime, c.out) - c.in);
-          camP = (Math.min(v.currentTime, c.out) - c.in) / Math.max(0.01, c.out - c.in);
-          draw(gt);
+          const rem = c.out - cur.currentTime;
+          if (n && Xi > 0 && rem <= Xi && !nextStarted && nextReady) { nextStarted = true; nxt.play().catch(() => {}); }
+          const a = nextStarted ? Math.max(0, Math.min(1, 1 - rem / Xi)) : 0;
+          ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+          if (black) { drawClip(cur, c, a < 0.5 ? 1 - 2 * a : 0); if (nextStarted) drawClip(nxt, n, a > 0.5 ? 2 * a - 1 : 0); }
+          else { drawClip(cur, c, 1); if (nextStarted) drawClip(nxt, n, a); }
+          if (warm) { ctx.globalCompositeOperation = 'soft-light'; ctx.fillStyle = warm; ctx.fillRect(0, 0, W, H); ctx.globalCompositeOperation = 'source-over'; }
+          const gt = offset + (Math.min(cur.currentTime, c.out) - c.in);
+          for (const cp of caps) if (gt >= cp.start && gt < cp.end) drawCaption(ctx, cp, W, H);
+          gains[i % 2].gain.value = vol * (1 - a);
+          if (nextStarted) gains[(i + 1) % 2].gain.value = (n.muted ? 0 : 1) * a;
           onProgress(Math.min(0.99, gt / total), `Recording ${Math.round(gt)}/${Math.round(total)} s (real-time)…`);
-          if (v.currentTime >= c.out - 0.02 || v.ended) return finish();
+          if (cur.currentTime >= c.out - 0.02 || cur.ended) return finish();
           requestAnimationFrame(tick);
         };
-        v.addEventListener('ended', finish);
-        const iv = setInterval(() => { if (v.currentTime >= c.out - 0.02 || v.ended || cancelled) finish(); }, 100); // rAF stalls in background tabs
+        cur.addEventListener('ended', finish);
+        const iv = setInterval(() => { if (cur.currentTime >= c.out - 0.02 || cur.ended || cancelled) finish(); }, 100);
         tick();
       });
-      v.pause();
-      if (i < clips.length - 1 && rec.state === 'recording') rec.pause();
-      offset += c.out - c.in;
+      cur.pause(); gains[i % 2].gain.value = 0;
+      offset += (c.out - c.in) - (nextStarted ? Math.max(0, nxt.currentTime - n.in) : 0);
+      if (n && !nextStarted) { // no crossfade (or next wasn't ready): pause recording while it loads
+        if (rec.state === 'recording') rec.pause();
+        await nextPrep;
+      }
     }
     if (rec.state !== 'inactive') rec.stop();
     await stopped;
-    v.remove(); ac.close();
+    vids.forEach(v => v.remove()); ac.close();
     if (cancelled) throw new Error('Cancelled');
     const type = (mime || chunks[0]?.type || 'video/webm').split(';')[0];
     onProgress(1, 'Done');
     return { blob: new Blob(chunks, { type }), ext: type.includes('mp4') ? 'mp4' : 'webm', W, H };
   }
-  return { run, cancel: () => { cancelled = true; try { v.pause(); } catch {} } };
+  return { run, cancel: () => { cancelled = true; vids.forEach(v => { try { v.pause(); } catch {} }); } };
 }
 
 export async function seekTo(v, t) {
@@ -300,7 +317,8 @@ export async function exportChunked(proj, media, opts) {
   const FPS = 30, q = (x) => Math.round(x * FPS) / FPS;
   const d = clips.map(c => Math.max(2 / FPS, q(c.out - c.in)));
   const xf = +proj.xfade || 0;
-  const X = clips.slice(0, -1).map((c, j) => { const x = q(Math.min(xf, d[j] / 3, d[j + 1] / 3)); return x >= 3 / FPS ? x : 0; });
+  const X = xfadeDurations(clips, xf, FPS);
+  const xfType = proj.xfadeType === 'black' ? 'fadeblack' : 'fade';
   const P = []; { let t = 0; for (const di of d) { P.push(t); t += di; } } // preview-timeline start of each clip
   const outTotal = d.reduce((a, b) => a + b, 0) - X.reduce((a, b) => a + b, 0);
   const [W, H] = outputSize(clips, opts.res);
@@ -337,6 +355,7 @@ export async function exportChunked(proj, media, opts) {
     const v = [`[${inIdx}:v]setpts=PTS-STARTPTS`, `fps=${FPS}`, `scale=${NW}:${NH}:force_original_aspect_ratio=decrease`, `pad=${NW}:${NH}:(ow-iw)/2:(oh-ih)/2:black`, 'setsar=1'];
     if (c.enh?.stab) v.push('deshake=rx=32:ry=32:edge=mirror');
     if (cam) v.push(camFF(cam, d[clips.indexOf(c)], start, W, H, FPS)); else if (NW !== W) v.push(`scale=${W}:${H}`);
+    if (c.cam?.flip) v.push('hflip');
     const en = enhFF(proj, c); if (en) v.push(en);
     v.push('setsar=1', 'format=yuv420p', `tpad=stop_mode=clone:stop_duration=1`, `trim=end_frame=${N}`, 'setpts=PTS-STARTPTS');
     fc.push(v.join(',') + `[v${tag}]`);
@@ -387,7 +406,7 @@ export async function exportChunked(proj, media, opts) {
           '-ss', n.in.toFixed(3), '-t', (s1 + 0.5).toFixed(3), '-i', paths.get(n.mediaId)];
         const fc = [];
         chain(fc, 0, c, d[i] - s1, s1, 'x'); chain(fc, 1, n, 0, s1, 'y');
-        fc.push(`[vx][vy]xfade=transition=fade:duration=${s1.toFixed(4)}:offset=0[vt]`, `[ax][ay]acrossfade=d=${s1.toFixed(4)}[at]`);
+        fc.push(`[vx][vy]xfade=transition=${xfType}:duration=${s1.toFixed(4)}:offset=0[vt]`, `[ax][ay]acrossfade=d=${s1.toFixed(4)}[at]`);
         stage = `Crossfade ${i + 1}→${i + 2}…`;
         const vl = addCaps(fc, args, 2, 'vt', P[i] + d[i] - s1, s1);
         await runPiece(args, fc, vl, 'at', `p${pieces.length}.mkv`, s1);

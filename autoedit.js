@@ -11,15 +11,15 @@ const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(
 
 export const AUTO_DEFAULTS = {
   order: 'capture',      // capture | file | best
-  xfade: 0.4,            // seconds, 0 = hard cuts
+  xfade: '0.5',          // '0' hard cuts | '0.3' | '0.5' | '0.8' crossfade s | 'b0.5' dip to black
   strict: 'normal',      // loose | normal | strict
   color: true, denoise: true, sharpen: true, stabilize: true,
-  camera: true, camLevel: 2, // 1 subtle, 2 medium, 3 bold
+  camera: true, camLevel: 2, altAngle: false, // camLevel 1 subtle, 2 medium, 3 bold
 };
 export function loadAutoSettings() {
-  try { return { ...AUTO_DEFAULTS, ...JSON.parse(localStorage.getItem('vc.auto') || '{}') }; } catch { return { ...AUTO_DEFAULTS }; }
+  try { return { ...AUTO_DEFAULTS, ...JSON.parse(localStorage.getItem('vc.auto2') || '{}') }; } catch { return { ...AUTO_DEFAULTS }; }
 }
-export function saveAutoSettings(s) { localStorage.setItem('vc.auto', JSON.stringify(s)); }
+export function saveAutoSettings(s) { localStorage.setItem('vc.auto2', JSON.stringify(s)); }
 
 // ---------- capture time from MP4/MOV metadata (mvhd creation_time), without reading the whole file ----------
 export async function readCaptureTime(blob) {
@@ -119,7 +119,7 @@ function subject(d, g1, g2, w, h, sh) {
     const skin = r > 95 && gg > 40 && b > 20 && r > gg && r > b && r - Math.min(gg, b) > 15 && Math.abs(r - gg) > 15 ? 1 : 0;
     const cx = (x / w - 0.5), cy = (y / h - 0.45);
     const prior = Math.exp(-(cx * cx + cy * cy) / 0.08);
-    const wt = (mot * 4 + skin * 0.8) * (0.35 + prior) + prior * 0.05;
+    const wt = (mot * 3 + skin * 1.6) * (0.35 + prior) + prior * 0.05;
     sx += x * wt; sy += y * wt; sw += wt;
   }
   return sw > 0 ? { cx: sx / sw / w, cy: sy / sw / h, conf: clamp(sw / ((w * h) / 4) * 4, 0, 1) } : { cx: 0.5, cy: 0.5, conf: 0 };
@@ -421,66 +421,195 @@ export function enhanceFor(samples, settings) {
 }
 
 // ---------- Dynamic camera ----------
-const LEVELS = {
-  1: { zMed: 1.12, zClose: 1.22, push: 0.08, pan: 0.04, punchMin: 9 },
-  2: { zMed: 1.2, zClose: 1.4, push: 0.14, pan: 0.07, punchMin: 6 },
-  3: { zMed: 1.3, zClose: 1.65, push: 0.22, pan: 0.1, punchMin: 4 },
+// zMed/zClose/zPunch are crop factors (1.4 = 1/1.4 of the frame), push = relative zoom change over a shot.
+export const LEVELS = {
+  1: { zMed: 1.22, zClose: 1.45, zPunch: 1.6, push: 0.16, pan: 0.05, split: 4.5 },
+  2: { zMed: 1.4, zClose: 1.7, zPunch: 1.9, push: 0.25, pan: 0.08, split: 3 },
+  3: { zMed: 1.55, zClose: 1.9, zPunch: 2.2, push: 0.32, pan: 0.1, split: 2.2 },
 };
-function subjectOf(samples, a, b) {
-  if (!samples.length) return { cx: 0.5, cy: 0.5 };
-  const ss = samples.filter(s => s.t >= a - 0.01 && s.t <= b + 0.01);
-  const use = ss.length ? ss : samples;
-  // confidence-weighted, outlier-robust (median), then pulled slightly to centre
-  const cx = median(use.map(s => s.cx)), cy = median(use.map(s => s.cy));
-  const conf = median(use.map(s => s.conf || 0));
-  const k = 0.35 + 0.5 * conf;
-  return { cx: 0.5 + (cx - 0.5) * k, cy: 0.5 + (cy - 0.5) * k };
+export function subjectOf(samples, a, b) {
+  if (!samples?.length) return { cx: 0.5, cy: 0.5 };
+  const pick = (t0, t1) => { const ss = samples.filter(s => s.t >= t0 - 0.01 && s.t <= t1 + 0.01); return ss.length ? ss : samples; };
+  // outlier-robust (median), only lightly pulled toward the centre when detection is unsure
+  const at = (ss) => {
+    const cx = median(ss.map(s => s.cx)), cy = median(ss.map(s => s.cy)), conf = median(ss.map(s => s.conf || 0));
+    const k = 0.75 + 0.25 * conf;
+    return [0.5 + (cx - 0.5) * k, 0.5 + (cy - 0.5) * k];
+  };
+  const mid = (a + b) / 2, [cx, cy] = at(pick(a, mid)), [cx1, cy1] = at(pick(mid, b));
+  // smooth: move at most a little across one shot
+  return { cx, cy, cx1: cx + clamp(cx1 - cx, -0.08, 0.08), cy1: cy + clamp(cy1 - cy, -0.08, 0.08) };
+}
+// focus track [{t,x,y}] (media time) -> point at t
+export function trackAt(track, t) {
+  if (!track?.length) return null;
+  if (t <= track[0].t) return track[0];
+  for (let i = 1; i < track.length; i++) if (track[i].t >= t) {
+    const a = track[i - 1], b = track[i], f = (t - a.t) / Math.max(1e-3, b.t - a.t);
+    return { t, x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+  }
+  return track[track.length - 1];
+}
+export function subjectFromFocus(focus, a, b) {
+  if (!focus) return null;
+  const p = trackAt(focus.track, a) || focus, q = trackAt(focus.track, b) || focus;
+  return { cx: p.x, cy: p.y, cx1: q.x, cy1: q.y, focus: true };
 }
 // clamp centre so the crop window stays inside the frame
 export function clampCenter(cx, cy, z) { const m = 0.5 / z; return [clamp(cx, m, 1 - m), clamp(cy, m, 1 - m)]; }
 
-/** Split long shots into punch-in "angles" and assign a framing to every shot so cuts read like multi-cam. */
-export function planCamera(shots, level) {
+const TIGHT = new Set(['punch', 'close']);
+/**
+ * Split shots longer than ~3 s into 2-3 angles and give every shot an obvious framing/move, like multi-cam coverage.
+ * opts: { xfade, subjFn(shot, a, b) -> subject|null, altAngle }
+ * Angles of one continuous shot overlap by the crossfade length, so the dissolve blends the SAME moment from two
+ * framings (motion-matched), and split points are moved to the calmest nearby moment.
+ */
+export function planCamera(shots, level, opts = {}) {
   const L = LEVELS[level] || LEVELS[2];
+  const X = opts.xfade || 0;
   const out = [];
   for (const s of shots) {
     const len = s.out - s.in;
-    if (len >= L.punchMin * 1.6 && s.samples?.length) {
-      // split into 2-3 parts at evenly spaced points (punch-in cuts on the same shot)
-      const parts = clamp(Math.floor(len / L.punchMin), 2, 3);
-      for (let p = 0; p < parts; p++) {
-        const a = r2(s.in + len * p / parts), b = p === parts - 1 ? s.out : r2(s.in + len * (p + 1) / parts);
-        out.push({ ...s, in: a, out: b, punch: p > 0 });
+    if (len > L.split) {
+      const parts = len >= L.split * 2.2 ? 3 : 2;
+      const cuts = [];
+      for (let p = 1; p < parts; p++) {
+        let tc = s.in + len * p / parts;
+        // motion-matched: pick the calmest sample (least change) within ±0.6 s
+        const near = (s.samples || []).filter(x => Math.abs(x.t - tc) <= 0.6 && x.still != null);
+        if (near.length) tc = near.reduce((m, x) => (x.still < m.still ? x : m)).t;
+        cuts.push(r2(tc));
       }
-    } else out.push({ ...s });
+      let a = s.in;
+      cuts.concat([s.out]).forEach((b, p) => {
+        const inn = p === 0 ? a : Math.max(s.in, r2(a - X)); // overlap = crossfade length
+        out.push({ ...s, in: inn, out: b, angle: p });
+        a = b;
+      });
+    } else out.push({ ...s, angle: 0 });
   }
-  // cycle of framings; consecutive shots never repeat the same framing
-  const cycle = ['wide', 'push', 'close', 'pan', 'medium', 'pull', 'tilt', 'close'];
-  let ci = 0, prev = null;
+  // framing sequence: mostly medium/close moves; wide at most 1 in 10 here (spec: <= 1 in 5)
+  const seq = ['push', 'punch', 'pan', 'close', 'pull', 'medium', 'tilt', 'punch', 'wide', 'close'];
+  let k = 0, prev = null, n = 0;
   for (const s of out) {
-    let type = cycle[ci++ % cycle.length];
-    if (s.punch && (prev === 'close' || prev === 'push')) type = 'wide';
-    else if (s.punch) type = 'close';
-    if (type === prev) type = cycle[ci++ % cycle.length];
+    let type = seq[k++ % seq.length];
+    // alternate tight / loose on every cut, never repeat
+    if (prev && (type === prev || TIGHT.has(type) === TIGHT.has(prev))) {
+      const want = !TIGHT.has(prev);
+      for (let j = 0; j < seq.length; j++) { const t2 = seq[(k + j) % seq.length]; if (TIGHT.has(t2) === want && t2 !== prev && t2 !== 'wide') { type = t2; break; } }
+    }
     prev = type;
-    s.cam = camFor(type, subjectOf(s.samples || [], s.in, s.out), L);
+    const subj = (opts.subjFn && opts.subjFn(s, s.in, s.out)) || subjectOf(s.samples || [], s.in, s.out);
+    const flip = !!opts.altAngle && type !== 'wide' && n % 4 === 3;
+    s.cam = camFor(type, subj, L, flip);
+    n++;
   }
   return out;
 }
-export function camFor(type, subj, L) {
-  const { cx, cy } = subj;
+export function camFor(type, subj, L, flip = false) {
+  const cx = subj.cx, cy = subj.cy, cx1 = subj.cx1 ?? cx, cy1 = subj.cy1 ?? cy;
   const mk = (z0, z1, x0, y0, x1, y1) => {
     const [a, b] = clampCenter(x0, y0, z0), [c, d] = clampCenter(x1, y1, z1);
-    return { type, z0: +z0.toFixed(3), z1: +z1.toFixed(3), x0: +a.toFixed(3), y0: +b.toFixed(3), x1: +c.toFixed(3), y1: +d.toFixed(3) };
+    const o = { type, z0: +z0.toFixed(3), z1: +z1.toFixed(3), x0: +a.toFixed(3), y0: +b.toFixed(3), x1: +c.toFixed(3), y1: +d.toFixed(3) };
+    if (flip) o.flip = true;
+    return o;
   };
+  const mx = (cx + cx1) / 2, my = (cy + cy1) / 2;
   switch (type) {
-    case 'wide': return mk(1, 1, 0.5, 0.5, 0.5, 0.5);
-    case 'medium': return mk(L.zMed, L.zMed, cx, cy, cx, cy);
-    case 'close': return mk(L.zClose, L.zClose + 0.04, cx, cy, cx, cy);
-    case 'push': return mk(1.02, 1.02 + L.push * 1.6, 0.5, 0.5, cx, cy);
-    case 'pull': return mk(1.02 + L.push * 1.6, 1.02, cx, cy, 0.5, 0.5);
-    case 'pan': { const z = L.zMed; const dir = cx < 0.5 ? 1 : -1; return mk(z, z, cx - dir * L.pan, cy, cx + dir * L.pan, cy); }
-    case 'tilt': { const z = L.zMed; return mk(z, z, cx, cy + L.pan * 0.8, cx, cy - L.pan * 0.8); }
+    case 'wide': return mk(1.0, 1.12, 0.5, 0.5, 0.5 + (mx - 0.5) * 0.5, 0.5 + (my - 0.5) * 0.5); // even wides creep in
+    case 'medium': return mk(L.zMed, L.zMed * 1.08, cx, cy, cx1, cy1);
+    case 'close': return mk(L.zClose, L.zClose * 1.06, cx, cy, cx1, cy1);
+    case 'punch': return mk(L.zPunch, L.zPunch * 1.04, cx, cy, cx1, cy1);
+    case 'push': { const z0 = Math.max(1.05, L.zMed * 0.85); return mk(z0, z0 * (1 + L.push + 0.1), (0.5 + cx) / 2, (0.5 + cy) / 2, cx1, cy1); }
+    case 'pull': { const z1 = Math.max(1.05, L.zMed * 0.85); return mk(z1 * (1 + L.push + 0.1), z1, cx, cy, (0.5 + cx1) / 2, (0.5 + cy1) / 2); }
+    case 'pan': { const z = L.zMed * 1.05, dir = mx < 0.5 ? 1 : -1; return mk(z, z, cx - dir * L.pan, cy, cx1 + dir * L.pan, cy1); }
+    case 'tilt': { const z = L.zMed * 1.05; return mk(z, z, cx, cy + L.pan, cx1, cy1 - L.pan); }
   }
   return null;
 }
+export const CAM_TYPES = ['wide', 'medium', 'close', 'punch', 'push', 'pull', 'pan', 'tilt'];
+
+// ---------- focus tracking (tap a point, follow it through the clip) ----------
+// Template matching on 160-px grey frames sampled by fast playback; positions are smoothed.
+function grayPatch(g, W, x, y, s) {
+  const o = new Float32Array(s * s); let m = 0;
+  for (let j = 0; j < s; j++) for (let i = 0; i < s; i++) { const v = g[(y + j) * W + x + i]; o[j * s + i] = v; m += v; }
+  m /= s * s; let sd = 0; for (let i = 0; i < o.length; i++) { o[i] -= m; sd += o[i] * o[i]; }
+  return { p: o, sd: Math.sqrt(sd / o.length) };
+}
+function matchAt(g, W, x, y, T, s) {
+  let m = 0; for (let j = 0; j < s; j++) for (let i = 0; i < s; i++) m += g[(y + j) * W + x + i];
+  m /= s * s; let e = 0;
+  for (let j = 0; j < s; j += 1) for (let i = 0; i < s; i += 1) e += Math.abs(g[(y + j) * W + x + i] - m - T[j * s + i]);
+  return e / (s * s);
+}
+export function makeTemplate(gray, W, H, nx, ny) {
+  const s = Math.round(W * 0.16); // patch ~16% of width
+  const x = clamp(Math.round(nx * W - s / 2), 0, W - s), y = clamp(Math.round(ny * H - s / 2), 0, H - s);
+  const t = grayPatch(gray, W, x, y, s);
+  return { T: t.p, sd: t.sd, s, W, H, x, y };
+}
+export function grayOf(img, W, H) { return toGray(img, W * H); }
+export async function trackPoint(url, t0, t1, tpl, { signal, onTick, step = 0.25, rate = 8 } = {}) {
+  const v = analysisVideo();
+  await setSrc(v, url);
+  const { W, H, s, T, sd } = tpl;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  let px = tpl.x, py = tpl.y, first = true;
+  const pts = [];
+  const onFrame = (mt) => {
+    ctx.drawImage(v, 0, 0, W, H);
+    const g = toGray(ctx.getImageData(0, 0, W, H).data, W * H);
+    let best = Infinity, bx = px, by = py;
+    const R = first ? Math.max(W, H) : Math.round(W * 0.1), st = first ? 2 : 1;
+    for (let y = Math.max(0, py - R); y <= Math.min(H - s, py + R); y += st)
+      for (let x = Math.max(0, px - R); x <= Math.min(W - s, px + R); x += st) {
+        const e = matchAt(g, W, x, y, T, s); if (e < best) { best = e; bx = x; by = y; }
+      }
+    const ok = best < Math.max(6, sd * 0.9);
+    if (ok || first) { px = bx; py = by; }
+    first = false;
+    pts.push({ t: r2(mt), x: (px + s / 2) / W, y: (py + s / 2) / H, ok });
+    onTick && onTick(clamp((mt - t0) / Math.max(0.1, t1 - t0), 0, 1));
+  };
+  await playFrames(v, t0, t1, step, onFrame, signal, rate);
+  try { v.pause(); v.removeAttribute('src'); v.load(); } catch {}
+  if (!pts.length) return [];
+  // smooth: forward + backward exponential average (no jitter, no lag)
+  const sm = (k) => { const a = pts.map(p => p[k]); for (let i = 1; i < a.length; i++) a[i] = a[i - 1] + (a[i] - a[i - 1]) * 0.4; for (let i = a.length - 2; i >= 0; i--) a[i] = a[i + 1] + (a[i] - a[i + 1]) * 0.4; return a; };
+  const xs = sm('x'), ys = sm('y');
+  return pts.map((p, i) => ({ t: p.t, x: +xs[i].toFixed(3), y: +ys[i].toFixed(3) }));
+}
+// generic single-frame sampler: fast playback + rVFC, falls back to seeking; never hangs
+async function playFrames(v, t0, t1, step, onFrame, signal, rate = 8) {
+  let last = -1, next = t0;
+  const ok = await new Promise((resolve) => {
+    let done = false, lastProg = performance.now();
+    const finish = (r) => { if (done) return; done = true; clearInterval(wd); v.removeEventListener('ended', onEnd); try { v.pause(); v.playbackRate = 1; } catch {} resolve(r); };
+    const handle = (mt) => {
+      if (done) return; if (signal?.aborted) return finish(true);
+      if (mt <= last + 1e-4) return; last = mt; lastProg = performance.now();
+      if (mt >= next && mt <= t1) { try { onFrame(mt); } catch (e) { return finish(false); } while (next <= mt) next += step; }
+      if (mt >= t1 - 0.03) finish(true);
+    };
+    const onEnd = () => finish(true);
+    v.addEventListener('ended', onEnd);
+    if ('requestVideoFrameCallback' in v) { const cb = (n, md) => { handle(md.mediaTime); if (!done) v.requestVideoFrameCallback(cb); }; v.requestVideoFrameCallback(cb); }
+    else { const raf = () => { if (done) return; if (v.readyState >= 2) handle(v.currentTime); requestAnimationFrame(raf); }; requestAnimationFrame(raf); }
+    const wd = setInterval(() => { if (performance.now() - lastProg > 2500) finish(false); }, 250);
+    try { if (t0 > 0.05) v.currentTime = t0; } catch {}
+    v.playbackRate = rate;
+    const pp = v.play(); if (pp) pp.catch(() => finish(false));
+  });
+  if (ok || signal?.aborted) return;
+  let fails = 0;
+  for (let t = Math.max(next, t0); t <= t1; t += step) {
+    if (signal?.aborted) return;
+    try { const p = waitEv(v, 'seeked', 1500); v.currentTime = t; await p; onFrame(t); fails = 0; } catch { if (++fails >= 3) return; }
+  }
+}
+
+export function parseXf(v) { v = String(v ?? '0'); return { xfade: parseFloat(v.replace('b', '')) || 0, xfadeType: v.startsWith('b') ? 'black' : 'fade' }; }
+export const xfValue = (proj) => !proj.xfade ? '0' : (proj.xfadeType === 'black' ? 'b' : '') + proj.xfade;

@@ -55,15 +55,23 @@ Tap **⚡ Auto Edit**, pick one or more videos, and the app edits them on the de
    The preview uses CSS `matrix3d` (fisheye and boomerangs use WebGL). The ffmpeg export uses `perspective` and `lenscorrection`,
    and the real-time export uses the same WebGL shader. You can override any of it per clip in the Clip tab.
 5b. **⏱ Extend** (Off / ×1.5 / ×2 / 30 s / 60 s). Makes the edit longer **using only your footage**, with no generated frames:
-   - slow motion (0.5×) on the sharpest, steadiest stretches. At export, in-between frames are made with `minterpolate`
-     (Smooth) or frame blending (Fast); 60 fps sources just get retimed.
+   - slow motion (0.5×) on the sharpest, steadiest stretches. At export, in-between frames are made with frame blending
+     (**Fast, the default**) or `minterpolate` (Smooth, opt-in, much slower, ffmpeg engine only); 60 fps sources just get retimed.
    - boomerang loops (forward, then back) of best moments.
    - replays of best moments later on from another "camera": above or below, mirrored, sometimes fisheye.
    Per clip: Speed (0.75 / 0.5 / 0.33×) and 🔁 Boomerang in the Clip tab.
-6. **Export MP4 for iPhone.** Uses the chunked ffmpeg.wasm export: the source files are mounted read-only with WORKERFS (not
-   copied into memory), each shot and each crossfade is encoded as a small piece (H.264 yuv420p, 30 fps, capped bitrate), and
-   then the pieces are joined. Video is stream-copied, and audio is encoded once to AAC with `+faststart`. The result can be
-   previewed in-page before saving.
+6. **Export MP4 for iPhone (v7: fast path).** The exporter picks the fastest path that can do the job:
+   1. **Stream copy (remux)** when nothing needs rendering (plain trims/joins of same-format H.264/HEVC clips, Source size):
+      samples are copied into a new MP4 in well under a second. Starts at the keyframe at or before each in point.
+   2. **WebCodecs (default)**: mp4box.js demuxes the sources, `VideoDecoder` decodes, a WebGL shader draws the camera moves,
+      angles, fisheye, color, sharpen, crossfades and slow-mo blends, the GPU converts to I420 (BT.709 limited range), and
+      the hardware `VideoEncoder` (H.264 High, Safari 16.4+/Chrome) encodes. Audio is mixed/time-stretched in JS and encoded once
+      with `AudioEncoder` AAC (or, where that is missing, ffmpeg.wasm encodes only the audio and copies the video).
+      `mp4-muxer` writes the MP4 with moov first (faststart). One encode, no WebM→MP4 transcode. Progress shows speed and ETA.
+   3. **ffmpeg.wasm (fallback / "Compatible" engine)**: the chunked export (WORKERFS mounts, per-shot pieces, joined, AAC once,
+      `+faststart`). Used automatically for Smooth slow-mo, sources WebCodecs can't decode, or if the fast path fails; or pick it
+      in Export → Engine for denoise/stabilize.
+   **⚡ Quick export** (Export tab) = 720p, Good quality, fastest engine. The result can be previewed in-page before saving.
 
 After an Auto Edit, the normal timeline tools still work: trim, split, reorder, delete, captions, undo.
 Changing a setting re-plans instantly because the analysis is cached.
@@ -73,8 +81,10 @@ the capture date and the save to IndexedDB run in the background. `.mov` blobs a
 because WebKit can refuse `video/quicktime` blob URLs. ffmpeg.wasm loads only when you export. The 31 MB core is
 downloaded once with a progress readout into its own cache bucket (`vc-core-v1`), which app updates don't wipe.
 
-**Limits:** analysis takes about 1.5 s for a 10 s clip on a desktop (8× playback) and depends on the phone. Export speed is
-about 0.5 to 1× real time at 720p on a desktop. On iPhone, keep exports to roughly 5 minutes at 720p (or use 480p). The
+**Limits:** analysis takes about 1.5 s for a 10 s clip on a desktop (8× playback) and depends on the phone. Export speed (test
+edits, headless Linux with software GL + software H.264, so a real device with a GPU/hardware encoder is faster):
+17.5 s edit 34.8 s → ~17 s; ×2 extended 35 s edit 117.8 s → ~39 s (WebKit WebCodecs: 8.7 s / 17.7 s). Stream copy: ~0.1 s.
+The fast path skips denoise/stabilize; boomerang reverse frames are cached at ≤960 px. On iPhone, keep exports to roughly 5 minutes at 720p (or use 480p). The
 encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color,
 camera moves and crossfades, but not denoise or sharpen.
 
@@ -88,7 +98,7 @@ camera moves and crossfades, but not denoise or sharpen.
 | Text | Add text at playhead, drag it on the preview, size / color / X / Y / start / end / background box. Burned into export (rendered as PNG overlays, identical look to preview). SRT export and SRT import. |
 | Color | Brightness, contrast, saturation, warmth for the whole project — preview (CSS filter) and export (ffmpeg `eq` + `colorbalance`, close but not pixel-identical). |
 | Projects | Autosaves 1 s after each change; Projects list (open / delete / new); reopens the last project on launch. Storage usage shown. |
-| Export A | **ffmpeg.wasm** → H.264/AAC MP4 (480p / 720p / 1080p / source, 3 quality levels). Mixed sizes/orientations are letterboxed to the first clip's shape. |
+| Export A | **Fast MP4** (stream copy → WebCodecs hardware H.264 + AAC, moov first) with **ffmpeg.wasm** fallback → H.264/AAC MP4 (480p / 720p / 1080p / source, 3 quality levels). Mixed sizes/orientations are letterboxed to the first clip's shape. |
 | Export B | **Real-time export** (canvas + MediaRecorder): plays the timeline once and records it. Light on memory; on iPhone Safari it produces MP4 (H.264), on Chrome MP4 or WebM depending on build. |
 | Privacy | 18+ gate on first load (both boxes required), 🙈 / Esc privacy screen, auto-hide when switching apps (Settings), `noindex` meta, “erase everything on this device” in Settings. |
 | PWA | Manifest, icons, offline service worker (app shell + ffmpeg engine cached after first export). |
@@ -157,9 +167,12 @@ index.html  styles.css  app.js        UI + state + timeline + preview
 db.js                                  IndexedDB (media blobs + projects)
 render.js                              shared caption/color drawing, SRT helpers
 exporter.js                            ffmpeg.wasm export + real-time MediaRecorder export
+wcexport.js                            fast export: remux, WebCodecs decode/render/encode, mp4 muxing
+fx.js                                  WebGL renderer (camera, angles, fisheye, color, blend) shared by preview + exports
 ai.js                                  silence/motion/black detection, auto color, transcript timing
 hooks.js                               optional cloud/self-hosted enhance hooks
 sw.js  manifest.webmanifest  icons/    PWA
+vendor/webcodecs/                      mp4box.js 2.6.0 (BSD-3) + mp4-muxer 5.2.2 (MIT)
 vendor/ffmpeg/                         @ffmpeg/ffmpeg 0.12.15 + @ffmpeg/core 0.12.10 (single-thread, LGPL/GPL — see their licenses)
 shots/                                 UI screenshots
 ```

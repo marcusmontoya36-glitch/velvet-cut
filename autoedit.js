@@ -19,12 +19,16 @@ export const AUTO_DEFAULTS = {
   dutch: true,           // slight dutch tilt on some of the angled shots
   fish: '0.18',          // fisheye lens on some close / low shots: '0' off | '0.18' subtle | '0.32' strong
   extend: '0',           // '0' off | 'x1.5' | 'x2' | 't30' | 't60' (target seconds)
-  slowmo: 'smooth',      // smooth = motion-interpolated slow motion at export | fast = frame blend
+  slowmo: 'fast',        // fast = frame blend (default, works with the hardware encoder) | smooth = motion-interpolated (ffmpeg, slow)
 };
 export function loadAutoSettings() {
-  try { return { ...AUTO_DEFAULTS, ...JSON.parse(localStorage.getItem('vc.auto2') || '{}') }; } catch { return { ...AUTO_DEFAULTS }; }
+  try {
+    const saved = JSON.parse(localStorage.getItem('vc.auto2') || '{}');
+    if ((saved.sv || 0) < 7) { delete saved.slowmo; saved.sv = 7; } // v7: slow-mo defaults to Fast (smooth is opt-in)
+    return { ...AUTO_DEFAULTS, ...saved };
+  } catch { return { ...AUTO_DEFAULTS }; }
 }
-export function saveAutoSettings(s) { localStorage.setItem('vc.auto2', JSON.stringify(s)); }
+export function saveAutoSettings(s) { localStorage.setItem('vc.auto2', JSON.stringify({ ...s, sv: 7 })); }
 
 // ---------- capture time from MP4/MOV metadata (mvhd creation_time), without reading the whole file ----------
 export async function readCaptureTime(blob) {

@@ -2,6 +2,7 @@ import * as DB from './db.js';
 import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut } from './render.js';
 import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
+import { canRemux, remuxExport, wcBlocker, createWcExport } from './wcexport.js';
 import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue, lookOf, extendShots, editLength } from './autoedit.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
 import { loadAI, saveAI, HOOKS, providerReady, runHook } from './hooks.js';
@@ -748,10 +749,38 @@ function pickFile(accept) {
 // ---------------- export ----------------
 function exportOpts(onProgress) { return { res: $('#exRes').value, crf: +$('#exQ').value, burnCaptions: $('#exCaps').checked, onProgress }; }
 function setExportUI(busy) {
-  $('#exFf').disabled = busy; $('#exRt').disabled = busy; $('#exCancel').hidden = !busy;
+  $('#exFf').disabled = busy; $('#exRt').disabled = busy; $('#exQuick').disabled = busy; $('#exCancel').hidden = !busy;
   if (busy) { $('#exLink').hidden = true; $('#exBar').style.width = '0'; }
 }
-const prog = (f, msg) => { $('#exBar').style.width = Math.round(f * 100) + '%'; $('#exStatus').textContent = msg + (f > 0 && f < 1 ? ` ${Math.round(f * 100)}%` : ''); };
+// progress text with an ETA for engines that don't give one
+function withEta(set) {
+  const t0 = performance.now();
+  return (f, msg) => {
+    let m = msg;
+    if (f > 0.04 && f < 1 && !/left/.test(msg)) { const el = (performance.now() - t0) / 1000, eta = el / f * (1 - f); m += ` · about ${Math.ceil(eta)} s left`; }
+    set(f, m + (f > 0 && f < 1 ? ` (${Math.round(f * 100)}%)` : ''));
+  };
+}
+const prog = withEta((f, msg) => { $('#exBar').style.width = Math.round(f * 100) + '%'; $('#exStatus').textContent = msg; });
+const PATH_NAMES = { remux: 'stream copy, no re-encode', webcodecs: 'hardware H.264 encoder (WebCodecs)', ffmpeg: 'ffmpeg.wasm (compatible engine)' };
+/** fastest engine that can do this edit: stream copy -> WebCodecs (hardware) -> ffmpeg.wasm */
+async function bestExport(p, engine = $('#exEngine')?.value || 'auto') {
+  const opts = exportOpts(p);
+  if (engine !== 'ffmpeg') {
+    try {
+      const srcMin = Math.min(...clips().map(c => Math.min(c.w || 9999, c.h || 9999)));
+      if ((opts.res === 'src' || srcMin <= +opts.res) && await canRemux(S.proj, S.media, opts)) { S.exportJob = { cancel() {} }; return await remuxExport(S.proj, S.media, opts); }
+      const why = await wcBlocker(S.proj, S.media, opts);
+      if (!why) { const job = createWcExport(S.proj, S.media, opts); S.exportJob = job; return await job.run(); }
+      console.info('[export] fast path not available:', why); p(0, `Using the compatible engine (${why})…`);
+    } catch (e) {
+      if (e?.message === 'Cancelled') throw e;
+      console.warn('[export] fast path failed, falling back to ffmpeg.wasm', e); p(0, 'Fast export hit a problem, so using the compatible engine…');
+    }
+  }
+  S.exportJob = { cancel: cancelFF };
+  const r = await exportChunked(S.proj, S.media, opts); r.path = 'ffmpeg'; return r;
+}
 function finishExport(res, t0) {
   const a = $('#exLink');
   if (a.href) URL.revokeObjectURL(a.href);
@@ -759,20 +788,19 @@ function finishExport(res, t0) {
   a.download = `${(S.proj.name || 'export').replace(/[^\w-]+/g, '_')}.${res.ext}`;
   a.hidden = false;
   a.textContent = `⬇ Save ${res.ext.toUpperCase()} (${(res.blob.size / 1048576).toFixed(1)} MB, ${res.W}×${res.H})`;
-  $('#exStatus').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)}s. On iPhone: tap Save, then Share → Save Video.`;
+  $('#exStatus').textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)} s${res.path ? ' · ' + PATH_NAMES[res.path] : ''}. On iPhone: tap Save, then Share → Save Video.`;
   window.__lastExport = res;
 }
 async function doExportFF() {
   if (!clips().length) return toast('Timeline is empty');
   const big = [...new Set(clips().map(c => c.mediaId))].reduce((a, id) => a + (S.media.get(id)?.blob.size || 0), 0);
   const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  if ((isIOS && big > 150e6) || big > 1.2e9) {
+  if ($('#exEngine').value === 'ffmpeg' && ((isIOS && big > 150e6) || big > 1.2e9)) {
     const go = await modal('Heavy export', html(`<p>Sources total ${(big / 1048576).toFixed(0)} MB. ffmpeg.wasm keeps everything in memory${isIOS ? ' and iPhone Safari may reload the tab' : ''}. <b>Real-time export</b> is safer for big files.</p>`), [{ label: 'Cancel', value: false }, { label: 'Try anyway', cls: 'primary', value: true }]);
     if (!go) return;
   }
   pause(); setExportUI(true); const t0 = performance.now();
-  S.exportJob = { cancel: cancelFF };
-  try { finishExport(await exportChunked(S.proj, S.media, exportOpts(prog)), t0); }
+  try { finishExport(await bestExport(prog), t0); }
   catch (e) { $('#exStatus').textContent = 'Export failed: ' + (e.message || e); console.error(e); }
   S.exportJob = null; setExportUI(false);
 }
@@ -979,7 +1007,7 @@ async function autoEdit(files) {
     const cuts = plan.cuts.map(c => ({ id: c.id, mediaId: c.mediaId, name: c.name, in: c.in, out: c.out, dur: c.dur, w: c.w, h: c.h, reasons: c.reasons, thumb: c.thumb, score: c.score, capture: c.capture, order: c.order }));
     mutate(() => {
       S.proj.clips = newClips; S.proj.autoCuts = cuts; S.proj.autoEnh = enh; S.proj.xfade = xf.xfade; S.proj.xfadeType = xf.xfadeType; S.sugg = [];
-      S.proj.slowmo = st.slowmo || 'smooth';
+      S.proj.slowmo = st.slowmo || 'fast';
       S.proj.extendInfo = ext.ops.length ? { base: +ext.base.toFixed(2), length: +ext.length.toFixed(2), target: +ext.target.toFixed(2), ops: ext.ops } : null;
       S.sel = newClips[0]?.id || null;
       if (S.proj.name === 'Untitled project') { S.proj.name = 'Auto edit ' + new Date().toLocaleDateString(); $('#projName').value = S.proj.name; }
@@ -1044,18 +1072,17 @@ async function doExportAuto() {
   const bar = $('#auExBar'), stt = $('#auExStatus'), link = $('#auExLink'), pv = $('#auPreview');
   $('#auExport').disabled = true; $('#auCancel').hidden = false; link.hidden = true; pv.hidden = true;
   const t0 = performance.now();
-  S.exportJob = { cancel: cancelFF };
-  const p = (f, msg) => { bar.style.width = Math.round(f * 100) + '%'; stt.textContent = msg + (f > 0 && f < 1 ? ` ${Math.round(f * 100)}%` : ''); };
+  const p = withEta((f, msg) => { bar.style.width = Math.round(f * 100) + '%'; stt.textContent = msg; });
   try {
-    const res = await exportChunked(S.proj, S.media, exportOpts(p));
+    const res = await bestExport(p, 'auto');
     if (link.href) URL.revokeObjectURL(link.href);
     link.href = URL.createObjectURL(res.blob);
     link.download = `${(S.proj.name || 'auto-edit').replace(/[^\w-]+/g, '_')}.mp4`;
     link.textContent = `⬇ Save MP4 (${(res.blob.size / 1048576).toFixed(1)} MB, ${res.W}×${res.H}, ${fmtTime(res.duration)})`;
     link.hidden = false; pv.src = link.href; pv.hidden = false;
-    stt.textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s. Watch it below. On iPhone: tap Save, then Share → Save Video.`;
+    stt.textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)} s · ${PATH_NAMES[res.path] || ''}. Watch it below. On iPhone: tap Save, then Share → Save Video.`;
     window.__lastExport = res;
-  } catch (e) { stt.textContent = 'Export failed: ' + (e.message || e) + ' — try 480p, or Export tab → Real-time export.'; console.error(e); }
+  } catch (e) { stt.textContent = e?.message === 'Cancelled' ? 'Cancelled.' : 'Export failed: ' + (e.message || e) + ' — try 480p, or Export tab → Real-time export.'; console.error(e); }
   S.exportJob = null; $('#auExport').disabled = false; $('#auCancel').hidden = true;
 }
 
@@ -1207,6 +1234,7 @@ function bind() {
 
   // export
   $('#exFf').onclick = doExportFF; $('#exRt').onclick = doExportRT;
+  $('#exQuick').onclick = () => { $('#exRes').value = '720'; $('#exQ').value = '23'; $('#exEngine').value = 'auto'; doExportFF(); };
   $('#exCancel').onclick = () => { S.exportJob?.cancel(); $('#exStatus').textContent = 'Cancelled'; };
 
   // top bar

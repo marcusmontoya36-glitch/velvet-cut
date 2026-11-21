@@ -385,7 +385,7 @@ export async function exportChunked(proj, media, opts) {
     const sp = clipSpeed(c);
     return ['-ss', (c.in + start * sp).toFixed(3), '-t', (len * sp + 0.5).toFixed(3)];
   };
-  const slowMode = proj.slowmo || 'smooth';
+  const slowMode = proj.slowmo || 'fast';
   // captions (preview-timeline times)
   const caps = opts.burnCaptions ? (proj.captions || []).filter(c => c.text && c.end > c.start) : [];
   for (let j = 0; j < caps.length; j++) await f.writeFile(`cap${j}.png`, await captionPng(caps[j], W, H));

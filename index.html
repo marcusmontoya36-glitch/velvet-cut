@@ -129,8 +129,8 @@
           </select></label>
         </div>
         <label>Slow motion quality<select id="auSlow">
-          <option value="smooth">Smooth — new in-between frames (slower export)</option>
-          <option value="fast">Fast — frame blending</option>
+          <option value="fast">Fast — frame blending (default)</option>
+          <option value="smooth">Smooth — new in-between frames (much slower export)</option>
         </select></label>
         <p class="muted small">Extend uses only your footage: slow motion on the sharpest, steadiest moments, boomerang loops, and replays of the best moments from another angle.</p>
         <p class="muted small">🎯 Tip: Clip tab → <b>Set focus</b>, tap her on the preview, and every crop/zoom follows that spot.</p>
@@ -279,13 +279,18 @@
         <option value="0">Hard cuts</option><option value="0.3">Crossfade 0.3 s</option><option value="0.5">Crossfade 0.5 s</option><option value="0.8">Crossfade 0.8 s</option><option value="b0.5">Dip to black 0.5 s</option>
       </select></label>
       <label class="chk"><input id="exCaps" type="checkbox" checked> Burn in text</label>
-      <button id="exFf" class="primary wide">⬇ Export MP4 (ffmpeg.wasm)</button>
+      <label>Engine<select id="exEngine">
+        <option value="auto">Fastest: hardware encoder (WebCodecs) or stream copy</option>
+        <option value="ffmpeg">Compatible: ffmpeg.wasm (slower; denoise, stabilize, smooth slow-mo)</option>
+      </select></label>
+      <button id="exQuick" class="primary wide">⚡ Quick export (720p MP4)</button>
+      <button id="exFf" class="wide">⬇ Export MP4 with these settings</button>
       <button id="exRt" class="wide">⏺ Real-time export (light, iPhone-friendly)</button>
       <button id="exCancel" class="danger wide" hidden>Cancel</button>
       <div class="progress"><div id="exBar"></div></div>
       <div id="exStatus" class="muted small"></div>
       <a id="exLink" class="btn primary wide" hidden download>Save video</a>
-      <p class="muted small">ffmpeg.wasm downloads a ~31&nbsp;MB engine once and encodes on-device (CPU-heavy; keep the tab open). Real-time export plays the timeline once and records it.</p>
+      <p class="muted small">The fast engine uses the phone's video encoder (iPhone: Safari 16.4+), and edits with no visual change are copied without re-encoding. If it isn't available, the app falls back to ffmpeg.wasm (a ~31&nbsp;MB engine downloaded once). Real-time export plays the timeline once and records it.</p>
     </div>
   </section>
 

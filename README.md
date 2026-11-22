@@ -88,6 +88,36 @@ The fast path skips denoise/stabilize; boomerang reverse frames are cached at �
 encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color,
 camera moves and crossfades, but not denoise or sharpen.
 
+## 🎥 Multi-cam (same moment, several phones/angles)
+Upload several clips filmed at the same time from different spots and run **⚡ Auto Edit**. The app finds which clips
+belong together, lines them up on one shared timeline, and cuts between the cameras.
+
+- **Sync by sound:** each clip's audio is decoded at 8 kHz in the browser. A 100 Hz onset envelope gives a coarse
+  match (FFT cross-correlation), and GCC-PHAT on the waveform refines it to well under 1 ms. On synthetic 3-camera
+  test footage (different mics, EQ, noise, 44.1/48 kHz) the detected offsets were off by −0.017, −0.010 and
+  +0.007 ms. Unrelated clips are rejected. If the sound doesn't match, clips whose capture times overlap by ≥ 2 s
+  are grouped by date instead (accurate to about ±1 s).
+- **Auto Edit settings:** Multi-cam (auto/off), Between cameras (hard cut, 0.2 s dissolve, 0.4 s) and Camera pace
+  (fast 1.5–3 s / normal 2–5 s / slow 3–7 s). It cuts to whichever angle is sharpest and steadiest at that moment
+  (using the same bad-shot scoring), avoids long runs on one camera, gives every camera a share, and lands cuts on
+  beats/transients. It drops moments where every camera is bad.
+- **Continuous sound:** the longest camera is the master track. Every shot plays the master's sound for its exact
+  moment, so the audio runs straight through camera switches (preview, fast export and ffmpeg export).
+- **Manual control:** the 🎥 panel in the Auto tab shows each group with offsets and confidence. Use
+  −0.1 s / −1 frame / +1 frame / +0.1 s to nudge, Auto / Not multi-cam / In multi-cam N / New group to override
+  grouping, and ↻ to re-sync. In the Clip tab, **Camera** switches a selected shot to another angle of the same
+  moment and keeps the master sound.
+- Virtual angles (high/low/dutch), fisheye, slow-mo, replays and Extend still apply on top.
+
+**Multi-cam limits:**
+- Clock drift between devices isn't corrected (fine for clips of a few minutes).
+- A camera whose frames fall between the output's frames can be up to half a frame (≤ 17 ms) off the sound.
+- Fast sound sync needs AAC audio; other codecs fall back to a slower whole-file decode.
+- Clips with no shared sound only group by capture time (±1 s). Use the nudge buttons to fix them.
+- Changing nudges or groups re-plans the edit and drops manual camera picks.
+- Boomerangs and the real-time export use each camera's own sound.
+- Very tight or moving shots can be read as "shaky".
+
 ## Features
 
 | Area | What works |
@@ -137,7 +167,7 @@ Nothing is sent unless you press a hook button and confirm the upload dialog.
 - Browser storage can be evicted if the device runs low on space; the app requests persistent storage,
   but keep originals elsewhere. Clearing Safari website data deletes projects.
 - Live dictate needs a microphone and works best in a quiet room.
-- No multi-track (one video track + one text track), no audio mixing / music track yet.
+- No free multi-track editing or music track yet (multi-cam uses one master sound track).
 
 ## AI enhance (fal.ai — wired)
 **Turn it on:** get a key at [fal.ai/dashboard/keys](https://fal.ai/dashboard/keys) → ⚙️ Settings → Provider **fal.ai** →
@@ -168,6 +198,7 @@ db.js                                  IndexedDB (media blobs + projects)
 render.js                              shared caption/color drawing, SRT helpers
 exporter.js                            ffmpeg.wasm export + real-time MediaRecorder export
 wcexport.js                            fast export: remux, WebCodecs decode/render/encode, mp4 muxing
+multicam.js                            multi-cam: audio sync (onset xcorr + GCC-PHAT), grouping, camera switching plan
 fx.js                                  WebGL renderer (camera, angles, fisheye, color, blend) shared by preview + exports
 ai.js                                  silence/motion/black detection, auto color, transcript timing
 hooks.js                               optional cloud/self-hosted enhance hooks

@@ -132,6 +132,14 @@ button.big{padding:14px 12px;font-size:16px;font-weight:700}
 .aucut img{width:72px;height:40px;object-fit:cover;border-radius:6px;background:#000;flex:none}
 .aucut .t{flex:1;font-size:12px;min-width:0}
 .aucut .tag{display:inline-block;margin:2px 3px 0 0;padding:1px 6px;border-radius:9px;background:#3a1f2c;color:#ff9fc4;font-size:10px}
+.mcbox{margin:8px 0;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--bg2);font-size:13px}
+.mcg{margin-bottom:8px}
+.mcrow{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid var(--line)}
+.mccam{flex:none;width:26px;height:26px;border-radius:50%;background:#3a1f2c;color:#ff9fc4;display:inline-flex;align-items:center;justify-content:center;font-weight:700}
+.mcname{flex:1;min-width:120px;font-size:12px;word-break:break-word}
+.mcnudge{display:flex;gap:3px}
+.mcnudge button{min-height:32px;padding:4px 7px;font-size:12px}
+.mcassign{width:auto;min-width:120px;font-size:12px}
 .aupreview{width:100%;margin-top:8px;border-radius:10px;background:#000;max-height:50vh}
 #player{transform-origin:50% 50%;will-change:transform}
 

@@ -20,6 +20,9 @@ export const AUTO_DEFAULTS = {
   fish: '0.18',          // fisheye lens on some close / low shots: '0' off | '0.18' subtle | '0.32' strong
   extend: '0',           // '0' off | 'x1.5' | 'x2' | 't30' | 't60' (target seconds)
   slowmo: 'fast',        // fast = frame blend (default, works with the hardware encoder) | smooth = motion-interpolated (ffmpeg, slow)
+  multicam: 'auto',      // auto = find clips filmed at the same time (by sound) and cut between their angles | off
+  mcXfade: '0.2',        // transition between cameras: '0' hard cut | '0.2' quick dissolve | '0.4'
+  mcPace: 'normal',      // switch cameras every: fast 1.5-3 s | normal 2-5 s | slow 3-7 s
 };
 export function loadAutoSettings() {
   try {
@@ -28,7 +31,7 @@ export function loadAutoSettings() {
     return { ...AUTO_DEFAULTS, ...saved };
   } catch { return { ...AUTO_DEFAULTS }; }
 }
-export function saveAutoSettings(s) { localStorage.setItem('vc.auto2', JSON.stringify({ ...s, sv: 7 })); }
+export function saveAutoSettings(s) { localStorage.setItem('vc.auto2', JSON.stringify({ ...s, sv: 8 })); }
 
 // ---------- capture time from MP4/MOV metadata (mvhd creation_time), without reading the whole file ----------
 export async function readCaptureTime(blob) {
@@ -324,7 +327,7 @@ function flagSamples(samples, lapRef, P) {
     } else i++;
   }
 }
-function quality(s, lapRef) {
+export function quality(s, lapRef) {
   const sharp = clamp(s.lap / Math.max(1, lapRef), 0, 1.5);
   const expo = 1 - clamp(Math.abs(s.luma - 0.47) / 0.47, 0, 1);
   const steady = 1 - clamp(s.shake / 0.07, 0, 1);
@@ -343,6 +346,7 @@ export function planEdit(items, settings) {
   const keep = [], cuts = [];
   for (const it of items) {
     if (!it.samples.length) { // couldn't read frames (e.g. decoder busy) - keep the whole clip rather than drop it
+      if (settings.skip?.has(it.mediaId)) continue;
       keep.push({ mediaId: it.mediaId, name: it.name, in: it.in, out: it.out, dur: it.dur, w: it.w, h: it.h, score: 0.5, order: it.order, capture: it.capture, sig: new Float32Array(144).fill(-9), samples: [], thumb: '' });
       continue;
     }
@@ -350,6 +354,7 @@ export function planEdit(items, settings) {
     // detailed (plain walls, soft light) isn't called blurry, but a clip much softer than the rest still is
     const clipLap = pct(it.samples.filter(s => s.luma > 0.12 && s.luma < 0.88).map(s => s.lap), 0.7) || lapRef;
     flagSamples(it.samples, Math.sqrt(lapRef * clipLap), P);
+    if (settings.skip?.has(it.mediaId)) continue; // multi-cam clips: flagged here, cut by the multi-cam planner
     const S = it.samples, h = it.step / 2;
     const bounds = (k) => [clamp(S[k].t - h, it.in, it.out), clamp(S[k].t + h, it.in, it.out)];
     // ignore isolated single bad samples (except exposure) - avoids chopping on one soft frame
@@ -480,7 +485,7 @@ export function planCamera(shots, level, opts = {}) {
   const out = [];
   for (const s of shots) {
     const len = s.out - s.in;
-    if (len > L.split && !s.boom) {
+    if (len > L.split && !s.boom && !s.mc) { // real multi-cam segments are already short angle changes
       const parts = len >= L.split * 2.2 ? 3 : 2;
       const cuts = [];
       for (let p = 1; p < parts; p++) {

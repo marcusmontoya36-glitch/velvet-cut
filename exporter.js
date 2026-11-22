@@ -1,6 +1,6 @@
 // Export engines: (1) ffmpeg.wasm (single-thread, no special headers needed), (2) real-time canvas + MediaRecorder.
 import { FFmpeg } from './vendor/ffmpeg/index.js';
-import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish } from './render.js';
+import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish, programAudio } from './render.js';
 import { createFx } from './fx.js';
 
 let ff = null;
@@ -366,7 +366,8 @@ export async function exportChunked(proj, media, opts) {
     const t = /time=(\d+):(\d+):([\d.]+)/.exec(m);
     if (t) { const s = +t[1] * 3600 + +t[2] * 60 + +t[3]; onProgress(Math.min(0.97, (pieceBase + Math.min(s, pieceLen)) / outTotal * 0.97), stage); }
   }, (msg) => onProgress(0, msg));
-  const ids = [...new Set(clips.map(c => c.mediaId))];
+  const progA = (c) => programAudio(c, media); // multi-cam: sound from the master camera
+  const ids = [...new Set(clips.flatMap(c => [c.mediaId, progA(c)?.mediaId].filter(Boolean)))];
   const list = ids.map(id => { const m = media.get(id); if (!m) throw new Error('Missing media for a clip — re-import it.'); return { id, ...m }; });
   onProgress(0, 'Opening sources…');
   const { paths, mounted } = await mountSources(f, list);
@@ -380,10 +381,12 @@ export async function exportChunked(proj, media, opts) {
     collecting = null;
   }
   // source window to read for timeline portion [start, start+len] of a clip -> ['-ss', a, '-t', b]
-  const srcWin = (c, start, len) => {
+  const srcWin = (c, start, len, shift = 0) => {
     if (c.boom) return ['-ss', c.in.toFixed(3), '-t', (c.out - c.in + 0.3).toFixed(3)];
     const sp = clipSpeed(c);
-    return ['-ss', (c.in + start * sp).toFixed(3), '-t', (len * sp + 0.5).toFixed(3)];
+    // video inputs seek 1 ms early so a frame sitting exactly on the in point isn't dropped by rounding
+    const at = c.in + shift + start * sp - (shift ? 0 : 0.001);
+    return ['-ss', Math.max(0, at).toFixed(4), '-t', (len * sp + 0.5).toFixed(3)];
   };
   const slowMode = proj.slowmo || 'fast';
   // captions (preview-timeline times)
@@ -392,7 +395,7 @@ export async function exportChunked(proj, media, opts) {
 
   // video+audio chain for one portion of a clip -> labels
   // boomerangs: the forward part is rendered with the camera, then reversed (reads exactly like the preview)
-  const chain = (fc, inIdx, c, start, len, tag) => {
+  const chain = (fc, inIdx, c, start, len, tag, aIdx = inIdx) => {
     const N = Math.round(len * FPS);
     const sp = clipSpeed(c), boom = !!c.boom;
     const interp = sp < 0.999 && srcFps.get(c.mediaId) * sp < 29; // slow motion that needs new in-between frames
@@ -421,8 +424,9 @@ export async function exportChunked(proj, media, opts) {
       fc.push(v.join(',') + `[v${tag}]`);
     }
     const ad = (N / FPS).toFixed(4);
-    if (hasAudio.get(c.mediaId) && !c.muted) {
-      const a = [`[${inIdx}:a]asetpts=PTS-STARTPTS`, 'aresample=44100', 'aformat=sample_fmts=fltp:channel_layouts=stereo'];
+    const aSrc = aIdx !== inIdx ? progA(c).mediaId : c.mediaId;
+    if (hasAudio.get(aSrc) && !c.muted) {
+      const a = [`[${aIdx}:a]asetpts=PTS-STARTPTS`, 'aresample=44100', 'aformat=sample_fmts=fltp:channel_layouts=stereo'];
       if (sp < 0.999) a.push(`atempo=${Math.max(0.5, sp).toFixed(4)}`);
       if (boom) a.push(`atrim=duration=${F.toFixed(4)}`, `afade=t=out:st=${Math.max(0, F - 0.15).toFixed(3)}:d=0.15`, 'apad', `atrim=start=${start.toFixed(4)}:duration=${ad}`, 'asetpts=PTS-STARTPTS');
       else a.push('apad', `atrim=duration=${ad}`);
@@ -462,8 +466,9 @@ export async function exportChunked(proj, media, opts) {
       onProgress(Math.min(0.97, pieceBase / outTotal * 0.97), stage);
       if (len >= 1 / FPS) {
         const args = ['-hide_banner', '-nostdin', ...srcWin(c, s0, len), '-i', paths.get(c.mediaId)];
-        const fc = []; chain(fc, 0, c, s0, len, 'b');
-        const vl = addCaps(fc, args, 1, 'vb', P[i] + s0, len);
+        const pa = progA(c); if (pa) args.push(...srcWin(c, s0, len, pa.off), '-i', paths.get(pa.mediaId));
+        const fc = []; chain(fc, 0, c, s0, len, 'b', pa ? 1 : 0);
+        const vl = addCaps(fc, args, pa ? 2 : 1, 'vb', P[i] + s0, len);
         await runPiece(args, fc, vl, 'ab', `p${pieces.length}.mkv`, len);
       }
       if (s1 > 0) { // crossfade into next shot
@@ -472,10 +477,13 @@ export async function exportChunked(proj, media, opts) {
           ...srcWin(c, d[i] - s1, s1), '-i', paths.get(c.mediaId),
           ...srcWin(n, 0, s1), '-i', paths.get(n.mediaId)];
         const fc = [];
-        chain(fc, 0, c, d[i] - s1, s1, 'x'); chain(fc, 1, n, 0, s1, 'y');
+        let ni = 2; const pc = progA(c), pn = progA(n);
+        const ac = pc ? ni++ : 0; if (pc) args.push(...srcWin(c, d[i] - s1, s1, pc.off), '-i', paths.get(pc.mediaId));
+        const an = pn ? ni++ : 1; if (pn) args.push(...srcWin(n, 0, s1, pn.off), '-i', paths.get(pn.mediaId));
+        chain(fc, 0, c, d[i] - s1, s1, 'x', ac); chain(fc, 1, n, 0, s1, 'y', an);
         fc.push(`[vx][vy]xfade=transition=${xfType}:duration=${s1.toFixed(4)}:offset=0[vt]`, `[ax][ay]acrossfade=d=${s1.toFixed(4)}[at]`);
         stage = `Crossfade ${i + 1}→${i + 2}…`;
-        const vl = addCaps(fc, args, 2, 'vt', P[i] + d[i] - s1, s1);
+        const vl = addCaps(fc, args, ni, 'vt', P[i] + d[i] - s1, s1);
         await runPiece(args, fc, vl, 'at', `p${pieces.length}.mkv`, s1);
       }
     }

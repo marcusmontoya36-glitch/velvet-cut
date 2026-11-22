@@ -6,7 +6,7 @@
 // Exports with no visual changes are stream-copied without any re-encode (remux).
 import { createFile, DataStream, Endianness, MP4BoxBuffer } from './vendor/webcodecs/mp4box.js';
 import { Muxer, ArrayBufferTarget } from './vendor/webcodecs/mp4-muxer.js';
-import { outputSize, xfadeDurations, clipDur, fwdDur, clipSpeed, srcAt, camP, clipColor, drawCaption, hasWarp, hasFish } from './render.js';
+import { outputSize, xfadeDurations, clipDur, fwdDur, clipSpeed, srcAt, camP, clipColor, drawCaption, hasWarp, hasFish, programAudio } from './render.js';
 import { createFx } from './fx.js';
 
 const FPS = 30, SR = 48000;
@@ -84,13 +84,16 @@ async function doDemux(blob) {
     const as = file.getTrackSamplesInfo(at.id), atsc = at.timescale;
     res.audio = { codec: at.codec, sampleRate: at.audio?.sample_rate, channels: at.audio?.channel_count, asc: asc ? new Uint8Array(asc) : null,
       samples: as.map(s => ({ cts: s.cts / atsc, dur: s.duration / atsc, offset: s.offset, size: s.size })) };
+    // encoder priming the edit list hides (AAC: 1024 / 2112 samples); needed to line up raw decoded audio
+    const mt = atrak.edts?.elst?.entries?.[0]?.media_time;
+    res.audio.skip = mt > 0 && mt / atsc < 1 ? mt / atsc : 0;
   }
   const cfg = { codec: res.codec, codedWidth: cw, codedHeight: ch, description };
   try { res.decodable = !!(await VideoDecoder.isConfigSupported(cfg)).supported; } catch { res.decodable = false; }
   return res;
 }
 // reads sample bytes through a sliding 4 MB window (sample data is mostly sequential)
-function byteReader(blob) {
+export function byteReader(blob) {
   let wa = -1, wb = -1, buf = null;
   return async (offset, size) => {
     if (offset < wa || offset + size > wb) { wa = offset; wb = Math.min(blob.size, offset + Math.max(size, 4 << 20)); buf = new Uint8Array(await blob.slice(wa, wb).arrayBuffer()); }
@@ -170,18 +173,21 @@ async function mixAudio(proj, media, tl, onStage) {
   for (let i = 0; i < clips.length; i++) {
     const c = clips[i];
     if (c.muted) continue;
-    const m = media.get(c.mediaId);
-    if (!bufs.has(c.mediaId)) {
+    // multi-cam: the program sound comes from one master camera (shifted onto this camera's clock)
+    const af = programAudio(c, media), srcId = af ? af.mediaId : c.mediaId, shift = af ? af.off : 0;
+    const m = media.get(srcId);
+    if (!bufs.has(srcId)) {
       onStage?.('Mixing audio…');
       const dm = await demux(m.blob).catch(() => null);
       let ab = null; if (!dm || dm.audio) { try { ab = await decodeAudio(m.blob); } catch { ab = null; } }
-      bufs.set(c.mediaId, ab);
+      bufs.set(srcId, ab);
     }
-    const ab = bufs.get(c.mediaId); if (!ab) continue;
+    const ab = bufs.get(srcId); if (!ab) continue;
     any = true;
     const ch = [ab.getChannelData(0), ab.getChannelData(ab.numberOfChannels > 1 ? 1 : 0)];
-    const sp = clipSpeed(c), a0 = Math.max(0, Math.round(c.in * SR)), a1 = Math.min(ch[0].length, Math.round(c.out * SR));
-    let seg = ch.map(x => x.subarray(a0, a1));
+    const sp = clipSpeed(c), r0 = Math.round((c.in + shift) * SR), r1 = Math.round((c.out + shift) * SR);
+    const a0 = Math.max(0, r0), a1 = Math.min(ch[0].length, r1), pad = a0 - r0;
+    let seg = ch.map(x => { if (!pad) return x.subarray(a0, Math.max(a0, a1)); const o = new Float32Array(Math.max(0, r1 - r0)); o.set(x.subarray(a0, Math.max(a0, a1)), Math.min(pad, o.length)); return o; });
     if (sp < 0.999) seg = stretch(seg, sp);
     const F = fwdDur(c), segLen = Math.round(F * SR);
     const start = Math.round(tl.T[i] * SR), D = Math.round(tl.d[i] * SR);
@@ -208,7 +214,44 @@ function wavBytes(chs) {
   let o = 44; for (let i = 0; i < n; i++) for (let c = 0; c < 2; c++) { const v = Math.max(-1, Math.min(1, chs[c][i])); dv.setInt16(o, v < 0 ? v * 32768 : v * 32767, true); o += 2; }
   return new Uint8Array(buf);
 }
+// AAC encoders put "priming" samples in front (Chrome: a few, WebKit/Safari: ~1000-2000) and mp4-muxer writes no
+// edit list to hide them, so the sound would come out late. Measure it once: encode a click, decode it, find it.
+let aacDelayP = null;
+function aacDelay() {
+  return aacDelayP ||= (async () => {
+    try {
+      if (typeof AudioDecoder === 'undefined') return 0;
+      const N = SR, pos = Math.round(0.25 * SR), B = 48, sig = new Float32Array(N * 2);
+      const tpl = new Float32Array(B); // in-band (3 kHz) windowed burst: survives the AAC low-pass
+      for (let i = 0; i < B; i++) { const v = 0.8 * Math.sin(Math.PI * i / B) ** 2 * Math.sin(2 * Math.PI * 3000 * i / SR); tpl[i] = v; sig[pos + i] = v; sig[N + pos + i] = v; }
+      const chunks = []; let cfg = null;
+      const enc = new AudioEncoder({ output: (c, m) => { if (m?.decoderConfig) cfg = m.decoderConfig; const d = new Uint8Array(c.byteLength); c.copyTo(d); chunks.push(d); }, error: () => {} });
+      enc.configure({ codec: 'mp4a.40.2', sampleRate: SR, numberOfChannels: 2, bitrate: 160000 });
+      const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: N, numberOfChannels: 2, timestamp: 0, data: sig });
+      enc.encode(ad); ad.close(); await enc.flush(); enc.close();
+      const out = [];
+      const dec = new AudioDecoder({ output: (a) => {
+        const fmt = a.format || 'f32-planar', planar = /planar/.test(fmt), ch = a.numberOfChannels, n = a.numberOfFrames;
+        const T = /^s16/.test(fmt) ? Int16Array : /^s32/.test(fmt) ? Int32Array : /^u8/.test(fmt) ? Uint8Array : Float32Array;
+        const buf = new T(planar ? n : n * ch); a.copyTo(buf, { planeIndex: 0 });
+        const k = T === Int16Array ? 32768 : T === Int32Array ? 2147483648 : 1, o = new Float32Array(n);
+        for (let i = 0; i < n; i++) o[i] = T === Uint8Array ? (buf[planar ? i : i * ch] - 128) / 128 : buf[planar ? i : i * ch] / k;
+        out.push(o); a.close();
+      }, error: () => {} });
+      dec.configure(cfg || { codec: 'mp4a.40.2', sampleRate: SR, numberOfChannels: 2 });
+      chunks.forEach((d, i) => dec.decode(new EncodedAudioChunk({ type: 'key', timestamp: Math.round(i * 1024 / SR * 1e6), data: d })));
+      await dec.flush(); dec.close();
+      const tot = out.reduce((a, o) => a + o.length, 0), y = new Float32Array(tot); let at = 0;
+      for (const o of out) { y.set(o, at); at += o.length; }
+      let e0 = 0; for (let i = 0; i < B; i++) e0 += tpl[i] * tpl[i];
+      let best = 0, d = 0;
+      for (let k = 0; k < 6000 && pos + k + B <= tot; k++) { let c = 0; for (let i = 0; i < B; i++) c += tpl[i] * y[pos + k + i]; if (c > best) { best = c; d = k; } }
+      return best > 0.3 * e0 ? d : 0;
+    } catch (e) { return 0; }
+  })();
+}
 async function encodeAac(chs, muxer) {
+  const D = await aacDelay(); // feed the sound D samples early so it lands on time
   // Re-time every chunk ourselves: one AAC-LC frame = 1024 samples. WebKit's AudioEncoder (Safari/iPhone)
   // stamps all frames from one AudioData with the same input timestamp, which breaks playback if trusted.
   let nOut = 0, err = null;
@@ -221,7 +264,8 @@ async function encodeAac(chs, muxer) {
   const n = chs[0].length, B = 4800;
   for (let s = 0; s < n; s += B) {
     const k = Math.min(B, n - s), data = new Float32Array(k * 2);
-    data.set(chs[0].subarray(s, s + k), 0); data.set(chs[1].subarray(s, s + k), k);
+    const a = Math.min(n, s + D), b = Math.min(n, s + D + k); // past the end: zeros
+    data.set(chs[0].subarray(a, b), 0); data.set(chs[1].subarray(a, b), k);
     const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: k, numberOfChannels: 2, timestamp: Math.round(s / SR * 1e6), data });
     enc.encode(ad); ad.close();
     if (err) throw err;
@@ -261,7 +305,7 @@ function needsNoRender(proj, opts) {
   if ((p.b || 0) !== 0 || (p.c ?? 1) !== 1 || (p.s ?? 1) !== 1 || p.w) return false;
   if (opts.burnCaptions && (proj.captions || []).some(c => c.text)) return false;
   if (proj.clips.length > 1 && (+proj.xfade || 0) > 0) return false;
-  return proj.clips.every(c => !c.enh && !c.boom && clipSpeed(c) >= 0.999 && !c.muted && (!c.cam || (c.cam.z0 <= 1.001 && c.cam.z1 <= 1.001 && !c.cam.flip && !hasWarp(c.cam) && !hasFish(c.cam))));
+  return proj.clips.every(c => !c.enh && !c.boom && !c.audioFrom && clipSpeed(c) >= 0.999 && !c.muted && (!c.cam || (c.cam.z0 <= 1.001 && c.cam.z1 <= 1.001 && !c.cam.flip && !hasWarp(c.cam) && !hasFish(c.cam))));
 }
 export async function canRemux(proj, media, opts) {
   if (!needsNoRender(proj, opts)) return false;
@@ -447,7 +491,7 @@ export function createWcExport(proj, media, opts = {}) {
       blob = new Blob([data.buffer], { type: 'video/mp4' });
     }
     onProgress(1, 'Done');
-    return { blob, ext: 'mp4', W, H, duration: tl.total, path: 'webcodecs', hw: caps.video.hw, codec: caps.video.codec, audioPath, secs: (performance.now() - t0) / 1000 };
+    return { blob, ext: 'mp4', W, H, duration: tl.total, path: 'webcodecs', hw: caps.video.hw, codec: caps.video.codec, audioPath, aacDelay: useAac ? await aacDelay() : 0, secs: (performance.now() - t0) / 1000 };
   }
   return { run, cancel: () => { cancelled = true; } };
 }

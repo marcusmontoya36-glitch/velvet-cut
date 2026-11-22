@@ -202,6 +202,12 @@ export function warpFF(cam, W, H) {
 export const clipSpeed = (c) => Math.min(1, Math.max(0.25, c?.speed || 1));
 export const fwdDur = (c) => (c.out - c.in) / clipSpeed(c);
 export const clipDur = (c) => fwdDur(c) * (c.boom ? 2 : 1);
+/** multi-cam program audio for a clip: { mediaId, off } (master time = clip time + off), or null = own sound */
+export function programAudio(c, media) {
+  const af = c.audioFrom;
+  if (!af || af.mediaId === c.mediaId || c.boom || !media.get(af.mediaId)) return null; // slow-mo stretches the master sound too
+  return af;
+}
 // source time shown at timeline-local time l
 export function srcAt(c, l) {
   const F = fwdDur(c), sp = clipSpeed(c);

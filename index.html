@@ -142,6 +142,12 @@
             <option value="fast">1.5–3 s (fast)</option><option value="normal">2–5 s</option><option value="slow">3–7 s (calm)</option>
           </select></label>
         </div>
+        <div class="grid2">
+          <label>🔁 Every-angle replays<select id="auMcReplay">
+            <option value="auto">Auto (about 1 per 30 s)</option><option value="0">Off</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="6">6</option>
+          </select></label>
+          <label class="chk"><input type="checkbox" id="auMcRSlow"> Slight slow-mo on replays</label>
+        </div>
         <label>Slow motion quality<select id="auSlow">
           <option value="fast">Fast — frame blending (default)</option>
           <option value="smooth">Smooth — new in-between frames (much slower export)</option>
@@ -184,6 +190,7 @@
             <option value="none">Straight</option><option value="dutch">Dutch tilt</option><option value="fish">Fisheye</option><option value="both">Dutch + fisheye</option>
           </select></label>
           <label id="ciMcRow" hidden>🎥 Camera (multi-cam)<select id="ciMcCam"></select></label>
+          <button id="ciAngles" class="wide" hidden>🔁 Mark moment — show all angles</button>
           <label>🌗 Shadows: <b id="ciShadowV">Auto</b><input id="ciShadow" type="range" min="0" max="100" step="1" value="0"></label>
           <label class="chk"><input type="checkbox" id="ciShadowAuto" checked> Auto shadows</label>
           <label>Speed<select id="ciSpeed">

@@ -24,6 +24,8 @@ export const AUTO_DEFAULTS = {
   multicam: 'auto',      // auto = find clips filmed at the same time (by sound) and cut between their angles | off
   mcXfade: '0.2',        // transition between cameras: '0' hard cut | '0.2' quick dissolve | '0.4'
   mcPace: 'normal',      // switch cameras every: fast 1.5-3 s | normal 2-5 s | slow 3-7 s
+  mcReplay: 'auto',      // every-angle replays of highlight moments: 'auto' (~1 per 30 s) | '0' off | count
+  mcReplaySlow: true,    // replays at 0.8x
 };
 export function loadAutoSettings() {
   try {
@@ -48,6 +50,13 @@ export async function readCaptureTime(blob) {
       if (type === 'moov') {
         const len = Math.min(size, 8 * 1024 * 1024);
         const mv = new Uint8Array(await blob.slice(off, off + len).arrayBuffer());
+        // iPhone: com.apple.quicktime.creationdate = recording start with time zone ("2026-11-20T15:00:00-0600"),
+        // kept when shared; mvhd is often rewritten (export / AirDrop / Photos picker), so prefer the Apple key
+        const txt = new TextDecoder('latin1').decode(mv), ki = txt.indexOf('com.apple.quicktime.creationdate');
+        if (ki >= 0) {
+          const m = txt.slice(ki).match(/(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?)([+-]\d\d:?\d\d|Z)?/);
+          if (m) { const ms = Date.parse(m[1] + (m[2] ? (m[2] === 'Z' ? 'Z' : m[2].slice(0, 3) + ':' + m[2].slice(-2)) : '')); if (ms > 946684800000) return ms; }
+        }
         for (let i = hdr; i < mv.length - 24; i++) {
           if (mv[i] === 0x6d && mv[i + 1] === 0x76 && mv[i + 2] === 0x68 && mv[i + 3] === 0x64) { // 'mvhd'
             const dv = new DataView(mv.buffer, i + 4);

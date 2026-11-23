@@ -107,35 +107,52 @@ Measured on synthetic underexposed 720p clips (gamma 1.9 ×0.6 + noise), auto st
 7–15 → 46–53 /255, frame mean 25–34 → 76–83, highlight clipping 0 % → ≤ 0.07 %. Normally exposed clips get 0–20.
 Export cost on the test box: fast path +8–27 %, ffmpeg.wasm +49 %.
 
-## 🎥 Multi-cam (same moment, several phones/angles)
-Upload several clips filmed at the same time from different spots and run **⚡ Auto Edit**. The app finds which clips
-belong together, lines them up on one shared timeline, and cuts between the cameras.
+## 🎥 Multi-cam (same scene, several phones/angles)
+Upload several clips of the same scene from different spots and run **⚡ Auto Edit**. The app finds which clips
+belong together, lines them up on one shared timeline, and cuts between the cameras. It never replays the scene once
+per clip. After every run the Auto tab says what it found: **“🎥 3 angles synced ✓ (by sound 100%)”** or
+**“🎥 Angles not matched …”** with the reason.
 
-- **Sync by sound:** each clip's audio is decoded at 8 kHz in the browser. A 100 Hz onset envelope gives a coarse
-  match (FFT cross-correlation), and GCC-PHAT on the waveform refines it to well under 1 ms. On synthetic 3-camera
-  test footage (different mics, EQ, noise, 44.1/48 kHz) the detected offsets were off by −0.017, −0.010 and
-  +0.007 ms. Unrelated clips are rejected. If the sound doesn't match, clips whose capture times overlap by ≥ 2 s
-  are grouped by date instead (accurate to about ±1 s).
+- **Sync by sound:** each clip's AAC track is decoded on the device and filtered down to 8 kHz. iPhone `.mov`
+  (HEVC or H.264, AAC 44.1/48 kHz, spatial-audio, metadata and timecode tracks) is handled by picking the AAC track
+  and trying, in order: WebCodecs AudioDecoder → ADTS + Web Audio → audio-only .m4a + Web Audio → whole file (small
+  files only) → ffmpeg.wasm audio-only. ffmpeg reads the file in place and downloads the engine once. Each clip's
+  row in the 🎥 panel says how its sound was read, or why it couldn't be.
+  Levels are normalised, so a quiet or far-away phone still matches (tested at −55 dBFS). The search covers every
+  offset, including cameras that started minutes apart, different lengths and partial overlaps (≥ 1.5 s). A 100 Hz
+  onset envelope gives a coarse match, and GCC-PHAT on the waveform refines it to under 1 ms. Each pair gets a
+  confidence score. A weaker match is accepted when a third camera confirms it (lag AB + lag BC ≈ lag AC). If the
+  sound doesn't match, clips whose capture times overlap are grouped by date. The date comes from iPhone's
+  `com.apple.quicktime.creationdate`, falling back to `mvhd`.
+- **🎥 Same scene — different angles:** tick clips in the 🎥 panel and tap it to force them into one multi-cam
+  group. It still uses the sound if it matches at all; otherwise the clips are **lined up by their start** (for
+  example, the scene filmed again from another spot), and each angle keeps its own sound. Nudge with −1 s / −0.1 s /
+  −1 frame / +1 frame / +0.1 s / +1 s. The **sync view** draws every camera's sound hits on the shared timeline, so
+  matching patterns line up vertically when the sync is right (replays show as light bands).
+- **“Are these the same scene from different angles?”** appears when clips weren't matched but have a similar
+  length and look. Tap Yes to group them; No hides the question for those clips.
+- **🔁 Every-angle replays** (Auto Edit settings, Auto ≈ 1 per 30 s, or 1–6, or Off): highlight moments, scored
+  on loud/busy sound, motion and sharpness where ≥ 2 cameras saw them, play back to back from every camera (A, then
+  B, then C; 1.6/2.2/3 s each depending on pace; slight 0.8× slow-mo optional; hard cuts or 0.2 s dissolve), and
+  then the edit carries on. **Clip tab → 🔁 Mark moment — show all angles** does the same by hand for the moment
+  just before the playhead.
 - **Auto Edit settings:** Multi-cam (auto/off), Between cameras (hard cut, 0.2 s dissolve, 0.4 s) and Camera pace
-  (fast 1.5–3 s / normal 2–5 s / slow 3–7 s). It cuts to whichever angle is sharpest and steadiest at that moment
-  (using the same bad-shot scoring), avoids long runs on one camera, gives every camera a share, and lands cuts on
-  beats/transients. It drops moments where every camera is bad.
-- **Continuous sound:** the longest camera is the master track. Every shot plays the master's sound for its exact
-  moment, so the audio runs straight through camera switches (preview, fast export and ffmpeg export).
-- **Manual control:** the 🎥 panel in the Auto tab shows each group with offsets and confidence. Use
-  −0.1 s / −1 frame / +1 frame / +0.1 s to nudge, Auto / Not multi-cam / In multi-cam N / New group to override
-  grouping, and ↻ to re-sync. In the Clip tab, **Camera** switches a selected shot to another angle of the same
-  moment and keeps the master sound.
-- Virtual angles (high/low/dutch), fisheye, slow-mo, replays and Extend still apply on top.
+  (fast 1.5–3 s / normal 2–5 s / slow 3–7 s). It cuts to whichever angle is sharpest and steadiest at that moment,
+  avoids long runs on one camera, gives every camera a share, and lands cuts on beats. It drops moments where every
+  camera is bad.
+- **Continuous sound:** for clips synced by sound, the longest camera is the master track. Every shot plays the
+  master's sound for its exact moment, so the audio runs straight through camera switches.
+- In the Clip tab, **Camera** switches a selected shot to another angle of the same moment.
 
 **Multi-cam limits:**
 - Clock drift between devices isn't corrected (fine for clips of a few minutes).
+- Clips lined up by start are only as accurate as your nudges. Takes filmed one after another are never truly in
+  sync, so the cuts show the same action from different takes.
+- The look-alike prompt is a heuristic (length, brightness, colour). It can miss angles that look very different,
+  or ask about unrelated clips.
 - A camera whose frames fall between the output's frames can be up to half a frame (≤ 17 ms) off the sound.
-- Fast sound sync needs AAC audio; other codecs fall back to a slower whole-file decode.
-- Clips with no shared sound only group by capture time (±1 s). Use the nudge buttons to fix them.
-- Changing nudges or groups re-plans the edit and drops manual camera picks.
+- Changing nudges or groups re-plans the edit and drops manual camera picks and manual replays.
 - Boomerangs and the real-time export use each camera's own sound.
-- Very tight or moving shots can be read as "shaky".
 
 ## Features
 

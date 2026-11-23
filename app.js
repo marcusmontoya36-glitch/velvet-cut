@@ -1,6 +1,6 @@
 import * as DB from './db.js';
 import { shadowAmt, cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut, programAudio } from './render.js';
-import { audioFeatures, groupClips, planMulticam, camsCovering } from './multicam.js';
+import { audioFeatures, groupClips, planMulticam, camsCovering, addAngleReplays, replaySequence } from './multicam.js';
 import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
 import { canRemux, remuxExport, wcBlocker, createWcExport } from './wcexport.js';
@@ -19,6 +19,7 @@ const S = {
   proj: newProject(), media: new Map(), sel: null, selCap: null, t: 0, playing: false, idx: -1,
   pxs: 30, mutedAll: false, sugg: [], undo: [], redo: [], switching: false, exportJob: null, analysis: new Map(), autoJob: null, xf: null, focusMode: false,
   mcFeat: new Map(), // mediaId -> audio sync features (or null = no usable sound), this session only
+  mcDiag: new Map(), // mediaId -> { via, tried:[{via, err}], tracks, level, ms } how its sound was read (sync report)
 };
 window.__S = S; // handy for debugging
 
@@ -955,7 +956,7 @@ function readAutoUI() {
     color: $('#auColor').checked, shadows: $('#auShadows').checked, denoise: $('#auDenoise').checked, sharpen: $('#auSharpen').checked, stabilize: $('#auStab').checked,
     camera: $('#auCam').checked, camLevel: +$('#auCamL').value,
     angles: $('#auAngles').checked, dutch: $('#auDutch').checked, fish: $('#auFish').value, extend: $('#auExtend').value, slowmo: $('#auSlow').value,
-    multicam: $('#auMc').value, mcXfade: $('#auMcXf').value, mcPace: $('#auMcPace').value };
+    multicam: $('#auMc').value, mcXfade: $('#auMcXf').value, mcPace: $('#auMcPace').value, mcReplay: $('#auMcReplay').value, mcReplaySlow: $('#auMcRSlow').checked };
 }
 function writeAutoUI(st) {
   $('#auOrder').value = st.order; $('#auXfade').value = String(st.xfade); $('#auStrict').value = st.strict;
@@ -965,6 +966,7 @@ function writeAutoUI(st) {
   $('#auAngles').checked = !!st.angles; $('#auDutch').checked = !!st.dutch; $('#auFish').value = String(st.fish ?? '0');
   $('#auExtend').value = String(st.extend || '0'); $('#auSlow').value = st.slowmo || 'fast';
   $('#auMc').value = st.multicam || 'auto'; $('#auMcXf').value = String(st.mcXfade ?? '0.2'); $('#auMcPace').value = st.mcPace || 'normal';
+  $('#auMcReplay').value = String(st.mcReplay ?? 'auto'); $('#auMcRSlow').checked = st.mcReplaySlow !== false;
 }
 function bindAuto() {
   writeAutoUI(loadAutoSettings());
@@ -976,7 +978,7 @@ function bindAuto() {
   $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
   $('#auExport').onclick = doExportAuto;
   $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
-  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace'].forEach(id => $(id).addEventListener('change', () => {
+  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace', '#auMcReplay', '#auMcRSlow'].forEach(id => $(id).addEventListener('change', () => {
     const st = readAutoUI(); saveAutoSettings(st); $('#auCamL').disabled = !st.camera;
     if (S.analysis.size && S.proj.autoCuts && !S.autoJob) { $('#auStatus').textContent = 'Settings changed — re-editing…'; autoEdit(null); }
   }));
@@ -1044,7 +1046,14 @@ async function autoEdit(files) {
       const r = planMulticam(g, itemMap, { xfade: xf.xfade, pace: st.mcPace, lapRef: plan.lapRef, envOf: (id) => S.mcFeat.get(id)?.env, nudge: S.proj.mc?.nudge });
       if (!r?.shots.length) continue;
       g.master = r.master;
-      r.shots.forEach(s => { s.name = `🎥${camLetter(s.mc.cam)} ${s.name}`; });
+      // every-angle replays: highlight moments played back to back from each camera, then the edit carries on
+      g.moments = [];
+      if (st.mcReplay !== '0') {
+        const rr = addAngleReplays(r.shots, g, itemMap, { count: st.mcReplay || 'auto', len: REPLAY_LEN[st.mcPace] || 2.2, slow: st.mcReplaySlow !== false ? 0.8 : 1,
+          xfade: xf.xfade, lapRef: plan.lapRef, envOf: (id) => S.mcFeat.get(id)?.env, nudge: S.proj.mc?.nudge });
+        r.shots = rr.shots; g.moments = rr.moments;
+      }
+      r.shots.forEach(s => { s.name = `${s.mc.replay ? '🔁' : '🎥'}${camLetter(s.mc.cam)} ${s.name}`; });
       const mem = g.members.map(m => itemMap.get(m.mediaId)).filter(Boolean);
       units.push({ shots: r.shots, cap: Math.min(...mem.map(it => it.capture ?? Infinity)), order: Math.min(...mem.map(it => it.order)), in: 0, score: r.shots.reduce((a, s) => a + s.score, 0) / r.shots.length });
       for (const c of r.cuts) {
@@ -1067,7 +1076,7 @@ async function autoEdit(files) {
     const newClips = shots.map((s, k) => {
       const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
       const e = (st.color || st.shadows || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
-      const o = { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}${s.ext === 'slow' ? ' · slow-mo' : s.ext === 'boom' ? ' · boomerang' : s.ext === 'replay' ? ' · replay' : ''}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
+      const o = { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}${s.ext === 'slow' ? ' · slow-mo' : s.ext === 'boom' ? ' · boomerang' : s.ext === 'replay' ? ' · replay' : s.ext === 'angles' ? ' · every angle' : ''}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
         enh: e, cam: st.camera ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
       if (s.speed && s.speed < 1) o.speed = s.speed;
       if (s.boom) o.boom = true;
@@ -1085,7 +1094,7 @@ async function autoEdit(files) {
       if (S.proj.name === 'Untitled project') { S.proj.name = 'Auto edit ' + new Date().toLocaleDateString(); $('#projName').value = S.proj.name; }
     });
     S.t = 0; seek(0);
-    auProg(1, `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s. Preview it, tweak anything on the timeline, then export.`);
+    auProg(1, `${mids.length >= 2 && st.multicam !== 'off' ? mcSummary(mids, groups) + ' · ' : ''}Done in ${((performance.now() - t0) / 1000).toFixed(0)} s. Preview it, tweak anything on the timeline, then export.`);
     window.__lastPlan = { plan, settings: st, ext };
   } catch (e) {
     auProg(0, e.message === 'Cancelled' ? 'Cancelled.' : 'Auto Edit failed: ' + (e.message || e));
@@ -1108,20 +1117,84 @@ async function syncCameras(mids) {
     const id = mids[i];
     if (!S.mcFeat.has(id)) {
       auProg(0.9, `Matching camera angles by sound… ${i + 1}/${mids.length}`);
-      let f = null; try { f = await audioFeatures(S.media.get(id).blob); } catch (e) { console.warn('[mc] no audio features', e); }
-      S.mcFeat.set(id, f);
+      const diag = {};
+      let f = null; try { f = await audioFeatures(S.media.get(id).blob, diag); } catch (e) { console.warn('[mc] no audio features', e); (diag.tried ||= []).push({ via: 'all', err: e.message || String(e) }); }
+      S.mcFeat.set(id, f); S.mcDiag.set(id, diag);
+      console.info(`[mc] sound of ${S.media.get(id).name}: ${f ? `${diag.via}, ${f.dur.toFixed(1)} s, ${diag.level} dB` : 'NOT READ'} in ${diag.ms} ms`, JSON.stringify({ tried: diag.tried, tracks: diag.tracks }));
     }
   }
   const key = [...mids].sort().join(',') + '|' + JSON.stringify(mc.assign || {});
   if (mc.key === key && mc.groups) return mc.groups;
   const t0 = performance.now();
   const list = mids.map(id => { const m = S.media.get(id); return { mediaId: id, dur: m.duration, feat: S.mcFeat.get(id), capture: m.captureMeta ?? null, size: m.blob?.size }; });
-  mc.groups = groupClips(list, { assign: mc.assign || {}, prev: mc.groups || [] });
+  const gs = groupClips(list, { assign: mc.assign || {}, prev: mc.groups || [] });
+  mc.pairs = gs.pairs || []; mc.groups = [...gs];
   mc.key = key;
+  console.info('[mc] pairs', JSON.stringify(mc.pairs));
   console.info(`[mc] sync ${mids.length} clips in ${Math.round(performance.now() - t0)} ms:`, JSON.stringify(mc.groups.map(g => g.members.map(m => [S.media.get(m.mediaId)?.name, m.off, m.conf, m.method]))));
   return mc.groups;
 }
 function mcRerun(msg) { if (S.autoJob) return; $('#auStatus').textContent = msg; autoEdit(null); }
+const REPLAY_LEN = { fast: 1.6, normal: 2.2, slow: 3 }; // seconds per angle in an every-angle replay
+const nmOf = (id) => S.media.get(id)?.name || '?';
+/** one line for the status: "🎥 3 angles synced ✓ (by sound 92%)" / "🎥 Angles not matched …" */
+function mcSummary(mids, groups) {
+  if (!groups.length) {
+    const noSound = mids.filter(id => S.mcFeat.has(id) && !S.mcFeat.get(id));
+    return noSound.length ? `🎥 Angles not matched — couldn't read the sound of ${noSound.length} clip${noSound.length > 1 ? 's' : ''} (see Multi-cam below)` : '🎥 Angles not matched by sound';
+  }
+  return groups.map(g => {
+    const ms = g.members.filter(m => m.method !== 'ref'), how = ms.every(m => m.method === 'audio') ? `by sound ${Math.round(Math.min(...ms.map(m => m.conf)) * 100)}%` : ms.some(m => m.method === 'start') ? 'lined up by start — nudge if needed' : ms.some(m => m.method === 'time') ? 'by capture time' : 'grouped by you';
+    return `🎥 ${g.members.length} angles synced ✓ (${how})`;
+  }).join(' · ');
+}
+/** clips that look like the same scene (not grouped): similar length + similar look */
+function lookAlike(ids) {
+  const stat = (id) => { const ss = S.analysis.get(id)?.samples || []; const m = S.media.get(id); const av = (k) => ss.reduce((a, x) => a + (x[k] || 0), 0) / Math.max(1, ss.length); return { d: m?.duration || 0, l: av('luma'), sat: av('sat'), port: (m?.h || 0) > (m?.w || 0) }; };
+  const st = ids.map(id => ({ id, ...stat(id) }));
+  const out = [];
+  for (const x of st) {
+    const sim = st.filter(y => y !== x && Math.min(x.d, y.d) / Math.max(x.d, y.d) >= 0.4 && Math.abs(x.l - y.l) < 0.18 && Math.abs(x.sat - y.sat) < 0.2);
+    if (sim.length) out.push(x.id);
+  }
+  return out;
+}
+function groupAsScene(ids, msg) {
+  if (ids.length < 2) return toast('Pick at least two clips');
+  const gid = 'g' + uid();
+  mutate(() => { const mcs = mcState(); mcs.assign ||= {}; ids.forEach(id => { mcs.assign[id] = gid; }); mcs.key = ''; delete mcs.noPrompt; });
+  mcRerun(msg || 'Grouping as one scene from different angles…');
+}
+function syncView(g, mc) {
+  const cv = document.createElement('canvas'); cv.className = 'mcview'; const W = 640, rowH = 22, H = rowH * g.members.length + 14;
+  cv.width = W; cv.height = H; const x = cv.getContext('2d');
+  const offs = g.members.map(m => m.off + (mc.nudge?.[m.mediaId] || 0)), durs = g.members.map(m => S.media.get(m.mediaId)?.duration || 0);
+  const G0 = Math.min(...offs), G1 = Math.max(...offs.map((o, i) => o + durs[i])), sx = (t) => (t - G0) / Math.max(1e-6, G1 - G0) * (W - 40) + 36;
+  x.fillStyle = '#111'; x.fillRect(0, 0, W, H); x.font = '12px sans-serif';
+  g.members.forEach((m, i) => {
+    const y = i * rowH + 4, env = S.mcFeat.get(m.mediaId)?.env;
+    x.fillStyle = '#aaa'; x.fillText(camLetter(i), 8, y + 15);
+    x.fillStyle = '#2a2a33'; x.fillRect(sx(offs[i]), y, sx(offs[i] + durs[i]) - sx(offs[i]), rowH - 4);
+    if (env) { // sound "hits" (onset envelope) — matching patterns line up vertically when the sync is right
+      x.fillStyle = ['#ff5c8a', '#5cd6ff', '#9dff5c', '#ffcf5c', '#c38bff'][i % 5];
+      const px0 = Math.floor(sx(offs[i])), px1 = Math.ceil(sx(offs[i] + durs[i]));
+      for (let px = px0; px < px1; px++) {
+        const t0 = ((px - 36) / (W - 40)) * (G1 - G0) + G0 - offs[i], t1 = t0 + (G1 - G0) / (W - 40);
+        let v = 0; for (let k = Math.max(0, Math.floor(t0 * 100)); k < Math.min(env.length, t1 * 100); k++) v = Math.max(v, env[k]);
+        const h = Math.min(rowH - 4, v * 3); x.fillRect(px, y + rowH - 4 - h, 1, h);
+      }
+    } else { x.fillStyle = '#777'; x.fillText('no sound read', sx(offs[i]) + 4, y + 14); }
+  });
+  (g.moments || []).forEach(mo => { x.fillStyle = 'rgba(255,255,255,.18)'; x.fillRect(sx(mo.g0), 0, Math.max(2, sx(mo.g1) - sx(mo.g0)), H - 12); });
+  x.fillStyle = '#888'; x.fillText(`${fmtTime(0)}`, 36, H - 2); x.fillText(fmtTime(G1 - G0), W - 44, H - 2);
+  return cv;
+}
+function diagLine(id) {
+  const d = S.mcDiag.get(id); if (!d) return '';
+  if (S.mcFeat.get(id)) return `sound read (${d.via}${d.level != null ? `, ${d.level} dB` : ''})`;
+  const why = (d.tried || []).map(t => `${t.via}: ${t.err}`).join('; ');
+  return `⚠ couldn't read the sound${d.tracks ? ` (tracks: ${d.tracks.map(t => t.codec).join(', ') || 'none'})` : ''}${why ? ` — ${why}` : ''}`;
+}
 function renderMcBox(box) {
   const mc = S.proj.mc, st = readAutoUI();
   const mids = [...new Set([...clips(), ...(S.proj.autoCuts || [])].map(c => c.mediaId))].filter(id => S.media.has(id));
@@ -1133,27 +1206,32 @@ function renderMcBox(box) {
     return `<option value="auto"${cur === 'auto' ? ' selected' : ''}>Auto</option><option value="none"${cur === 'none' ? ' selected' : ''}>Not multi-cam</option>` +
       groups.map((g, gi) => `<option value="${g.id}"${cur === g.id ? ' selected' : ''}>In multi-cam ${gi + 1}</option>`).join('') + `<option value="new">New multi-cam group</option>`;
   };
-  let h = groups.length ? '' : `<div class="muted small">🎥 Multi-cam: no clips filmed at the same time were found (their sound doesn't match). Put two clips in a group by hand below.</div>`;
+  const others = mids.filter(id => !inG.has(id));
+  const promptKey = others.slice().sort().join(',');
+  const alike = !groups.length && mc.noPrompt !== promptKey ? lookAlike(others) : [];
+  let h = `<div class="mcstat ${groups.length ? 'ok' : 'no'}">${esc(mcSummary(mids, groups))}</div>`;
+  if (alike.length >= 2) h += `<div class="mcprompt">These ${alike.length} clips look alike (similar length and look). <b>Are these the same scene from different angles?</b>
+    <div class="row"><button class="primary mcyes">Yes — cut between the angles</button><button class="mcno">No</button></div></div>`;
   groups.forEach((g, gi) => {
     const mem = [...g.members].sort((a, b) => a.off - b.off);
-    h += `<div class="mcg"><b>🎥 Multi-cam ${gi + 1}</b> · ${mem.length} angles synced${g.master ? ` · 🔊 sound from ${esc(S.media.get(g.master)?.name || '')}` : ''}`;
+    h += `<div class="mcg" data-g="${g.id}"><b>🎥 Multi-cam ${gi + 1}</b> · ${mem.length} angles synced${g.master ? ` · 🔊 sound from ${esc(nmOf(g.master))}` : ''}${g.moments?.length ? ` · 🔁 ${g.moments.length} every-angle replay${g.moments.length > 1 ? 's' : ''}` : ''}<div class="mcviewbox"></div>`;
     mem.forEach(m => {
-      const k = g.members.indexOf(m), md = S.media.get(m.mediaId), nud = mc.nudge?.[m.mediaId] || 0;
-      const how = m.method === 'ref' ? 'reference' : m.method === 'audio' ? `by sound ${Math.round(m.conf * 100)}%` : m.method === 'time' ? 'by capture time (±1 s, check it)' : 'manual';
-      h += `<div class="mcrow" data-id="${m.mediaId}"><span class="mccam">${camLetter(k)}</span><span class="mcname">${esc(md?.name || '?')}<br><span class="muted small">starts at ${(m.off + nud).toFixed(3)} s · ${how}${nud ? ` · nudged ${nud > 0 ? '+' : ''}${Math.round(nud * 1000)} ms` : ''}</span></span>
-        <span class="mcnudge"><button data-d="-0.1">−0.1s</button><button data-d="${(-1 / 30).toFixed(4)}">−1f</button><button data-d="${(1 / 30).toFixed(4)}">+1f</button><button data-d="0.1">+0.1s</button></span>
+      const k = g.members.indexOf(m), nud = mc.nudge?.[m.mediaId] || 0;
+      const how = m.method === 'ref' ? 'reference' : m.method === 'audio' ? `by sound ${Math.round(m.conf * 100)}%` : m.method === 'time' ? 'by capture time (±1 s, check it)' : m.method === 'start' ? 'lined up by start (sound didn\u2019t match) — nudge to sync' : 'manual';
+      h += `<div class="mcrow" data-id="${m.mediaId}"><span class="mccam">${camLetter(k)}</span><span class="mcname">${esc(nmOf(m.mediaId))}<br><span class="muted small">starts at ${(m.off + nud).toFixed(3)} s · ${how}${nud ? ` · nudged ${nud > 0 ? '+' : ''}${Math.round(nud * 1000)} ms` : ''}<br>${esc(diagLine(m.mediaId))}</span></span>
+        <span class="mcnudge"><button data-d="-1">−1s</button><button data-d="-0.1">−0.1s</button><button data-d="${(-1 / 30).toFixed(4)}">−1f</button><button data-d="${(1 / 30).toFixed(4)}">+1f</button><button data-d="0.1">+0.1s</button><button data-d="1">+1s</button></span>
         <select class="mcassign">${opts(m.mediaId)}</select></div>`;
     });
     h += `</div>`;
   });
-  const others = mids.filter(id => !inG.has(id));
   if (others.length) {
-    h += `<div class="mcg"><b>Other videos</b>`;
-    others.forEach(id => { h += `<div class="mcrow" data-id="${id}"><span class="mccam">·</span><span class="mcname">${esc(S.media.get(id)?.name || '?')}</span><select class="mcassign">${opts(id)}</select></div>`; });
-    h += `</div>`;
+    h += `<div class="mcg"><b>Other videos</b> <span class="muted small">— tick the clips that show the same scene:</span>`;
+    others.forEach(id => { h += `<div class="mcrow" data-id="${id}"><label class="chk mcpick"><input type="checkbox" class="mcsel" value="${id}" checked></label><span class="mcname">${esc(nmOf(id))}<br><span class="muted small">${esc(diagLine(id))}</span></span><select class="mcassign">${opts(id)}</select></div>`; });
+    h += `<button class="wide primary mcscene">🎥 Same scene — different angles (group the ticked clips)</button></div>`;
   }
   h += `<button class="wide mcresync">↻ Re-sync by sound (clears nudges and manual groups)</button>`;
   wrap.innerHTML = h;
+  groups.forEach(g => { const vb = wrap.querySelector(`.mcg[data-g="${g.id}"] .mcviewbox`); if (vb) vb.appendChild(syncView(g, mc)); });
   wrap.querySelectorAll('.mcnudge button').forEach(b => b.onclick = () => {
     const id = b.closest('.mcrow').dataset.id, mcs = mcState();
     mutate(() => { mcs.nudge ||= {}; const v = Math.round(((mcs.nudge[id] || 0) + +b.dataset.d) * 1000) / 1000; if (Math.abs(v) < 1e-4) delete mcs.nudge[id]; else mcs.nudge[id] = v; });
@@ -1164,13 +1242,44 @@ function renderMcBox(box) {
     mutate(() => { mcs.assign ||= {}; if (sel.value === 'auto') delete mcs.assign[id]; else mcs.assign[id] = sel.value === 'new' ? 'g' + uid() : sel.value; });
     mcRerun('Multi-cam grouping changed — re-syncing…');
   });
+  const sc = wrap.querySelector('.mcscene'); if (sc) sc.onclick = () => groupAsScene([...wrap.querySelectorAll('.mcsel:checked')].map(i => i.value));
+  const y = wrap.querySelector('.mcyes'); if (y) y.onclick = () => groupAsScene(alike);
+  const n = wrap.querySelector('.mcno'); if (n) n.onclick = () => { mutate(() => { mcState().noPrompt = promptKey; }); renderAuto(); };
   wrap.querySelector('.mcresync').onclick = () => { mutate(() => { const mcs = mcState(); mcs.assign = {}; mcs.nudge = {}; mcs.key = ''; }); mcRerun('Re-syncing by sound…'); };
   box.appendChild(wrap);
+}
+/** Clip tab / preview: replay the moment just before the playhead from every camera, then carry on */
+function markMomentAllAngles() {
+  const { idx, local } = locate(S.t); const c = clips()[idx];
+  const g = c?.mc ? mcGroupOf(c.mc.group) : null;
+  if (!c || !g) return toast('This works on multi-cam shots — group the clips with “🎥 Same scene — different angles” first');
+  if (c.mc.replay) return toast('Move the playhead onto a live shot (not a replay)');
+  const len = REPLAY_LEN[readAutoUI().mcPace] || 2.2;
+  const src = c.in + local * clipSpeed(c), co = mcOff(g, c.mediaId), T = src + co;
+  const cams = g.members.map((m, k) => { const md = S.media.get(m.mediaId); return md && { mediaId: m.mediaId, off: mcOff(g, m.mediaId), dur: md.duration, name: md.name.replace(/\.\w+$/, ''), w: md.w, h: md.h, k }; }).filter(Boolean);
+  const m1 = T, m0 = Math.max(T - len, Math.min(...cams.map(x => x.off)));
+  const mst = g.master && cams.find(x => x.mediaId === g.master);
+  const seq = replaySequence(cams, m0, m1, { slow: readAutoUI().mcReplaySlow !== false ? 0.8 : 1, xfade: S.proj.xfade || 0, group: g.id, master: mst || null });
+  if (seq.length < 2) return toast('Fewer than two cameras were recording at this moment');
+  const cut = +(c.in + local * clipSpeed(c)).toFixed(4);
+  mutate(() => {
+    const tail = { ...c, id: uid(), in: cut, mc: { ...c.mc, g0: +T.toFixed(4) } };
+    c.out = cut; c.mc = { ...c.mc, g1: +T.toFixed(4) };
+    const ins = seq.map(s => ({ id: uid(), mediaId: s.mediaId, name: `🔁${camLetter(s.mc.cam)} ${s.name} · every angle`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
+      enh: S.proj.autoEnh?.[s.mediaId] ? { ...S.proj.autoEnh[s.mediaId], stab: false } : (c.enh ? { ...c.enh } : null), cam: null, score: 0.6, capture: c.capture, order: c.order, thumb: '',
+      ...(s.speed ? { speed: s.speed } : {}), ext: 'angles', mc: { ...s.mc }, ...(s.audioFrom.mediaId !== s.mediaId ? { audioFrom: { ...s.audioFrom } } : {}) }));
+    const cs = clips(); const i = cs.indexOf(c);
+    const head = c.out - c.in > 0.05 ? 1 : 0; if (!head) cs.splice(i, 1);
+    cs.splice(i + head, 0, ...ins, tail); S.sel = ins[0].id;
+    (g.moments ||= []).push({ g0: +m0.toFixed(2), g1: +m1.toFixed(2), cams: seq.map(x => x.mc.cam), manual: true });
+  });
+  toast(`🔁 Moment replayed from ${seq.length} angles`);
 }
 /** Clip tab: pick which real camera shows this multi-cam segment */
 function renderMcPicker(c) {
   const row = $('#ciMcRow'), sel = $('#ciMcCam'); if (!row) return;
   const g = c.mc ? mcGroupOf(c.mc.group) : null, o = g ? mcOff(g, c.mediaId) : null;
+  const ab = $('#ciAngles'); if (ab) ab.hidden = !g || o == null || !!c.mc?.replay;
   if (!g || o == null) { row.hidden = true; return; }
   const a = c.in + o, b = c.out + o;
   const avail = camsCovering(g, a, b, (id) => S.media.get(id)?.duration, S.proj.mc?.nudge || {});
@@ -1209,7 +1318,7 @@ function renderAuto() {
   const angN = clips().filter(c => c.cam?.angle).length, fishN = clips().filter(c => hasFish(c.cam)).length;
   const ei = S.proj.extendInfo, cnt = (k) => (ei?.ops || []).filter(o => o.kind === k).length;
   const mcN = clips().filter(c => c.mc).length, mcG = new Set(clips().filter(c => c.mc).map(c => c.mc.group)).size;
-  const mcLine = mcN ? `<br>🎥 Multi-cam: ${mcN} cuts between ${new Set(clips().filter(c => c.mc).map(c => c.mediaId)).size} synced angles${mcG > 1 ? ` in ${mcG} groups` : ''}, one continuous sound track` : '';
+  const mcLine = mcN ? `<br>🎥 Multi-cam: ${mcN} cuts between ${new Set(clips().filter(c => c.mc).map(c => c.mediaId)).size} synced angles${mcG > 1 ? ` in ${mcG} groups` : ''}, ${(S.proj.mc?.groups || []).some(g => !g.master) ? 'each angle with its own sound (lined up by start)' : 'one continuous sound track'}${(() => { const n = (S.proj.mc?.groups || []).reduce((a, g) => a + (g.moments?.length || 0), 0); return n ? ` · 🔁 ${n} every-angle replay${n > 1 ? 's' : ''}` : ''; })()}` : '';
   const extLine = ei ? `<br>⏱ Extended ${ei.base.toFixed(1)} s → ${ei.length.toFixed(1)} s (target ${ei.target.toFixed(1)} s): ${cnt('slow')} slow-mo, ${cnt('boom')} boomerang, ${cnt('replay')} replay${cnt('replay') === 1 ? '' : 's'}` : '';
   box.innerHTML = `<div class="ausum"><b>${clips().length} shots · ${fmtTime(outLen)}</b> from ${srcN} video${srcN === 1 ? '' : 's'}${S.proj.xfade ? ` · ${S.proj.xfade}s ${S.proj.xfadeType === 'black' ? 'dips to black' : 'crossfades'}` : ' · hard cuts'}${camN ? ` · ${camN} camera moves` : ''}${angN ? ` · ${angN} from above/below` : ''}${fishN ? ` · ${fishN} fisheye` : ''}${mcLine}${extLine}<br>
     <span class="muted">Cut ${cuts.length} bad part${cuts.length === 1 ? '' : 's'} (${fmtTime(cutT)}). Tap Restore to put one back.</span></div>`;
@@ -1373,6 +1482,8 @@ function bind() {
   $('#ciSetIn').onclick = () => { const { idx, local } = locate(S.t); const c = clips()[idx]; if (!c) return; S.sel = c.id; mutate(() => { c.in = r2(clamp(c.in + local, 0, c.out - 0.1)); }); seek(starts()[idx]); };
   $('#ciSetOut').onclick = () => { const { idx, local } = locate(S.t); const c = clips()[idx]; if (!c) return; S.sel = c.id; mutate(() => { c.out = r2(clamp(c.in + local, c.in + 0.1, c.dur)); }); };
   $('#ciSplit').onclick = () => splitAt(S.t);
+  $('#ciAngles').onclick = markMomentAllAngles;
+  $('#pvAngles') && ($('#pvAngles').onclick = markMomentAllAngles);
   $('#ciMute').onclick = () => { const c = selClip(); if (!c) return; mutate(() => { c.muted = !c.muted; }); player.muted = S.mutedAll || c.muted || !!previewProg(c); };
   $('#ciDup').onclick = () => { const c = selClip(); if (!c) return; mutate(() => { const i = clips().indexOf(c); const d = { ...c, id: uid() }; clips().splice(i + 1, 0, d); S.sel = d.id; }); };
   $('#ciLeft').onclick = () => moveSel(-1); $('#ciRight').onclick = () => moveSel(1);

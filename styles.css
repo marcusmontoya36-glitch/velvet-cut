@@ -150,3 +150,11 @@ button.big{padding:14px 12px;font-size:16px;font-weight:700}
 .focusdot{position:absolute;z-index:7;width:22px;height:22px;margin:-11px 0 0 -11px;border:3px solid #ff4f9a;border-radius:50%;box-shadow:0 0 0 2px rgba(0,0,0,.6);pointer-events:none}
 .stage .tint{z-index:3}
 .drophint{z-index:9}
+
+.mcstat{font-weight:600;padding:6px 8px;border-radius:8px;margin-bottom:8px}
+.mcstat.ok{background:rgba(80,200,120,.15);color:#8fe3a8}
+.mcstat.no{background:rgba(255,180,80,.12);color:#ffcf8a}
+.mcprompt{padding:8px;border:1px solid var(--accent,#e0457b);border-radius:8px;margin-bottom:8px}
+.mcprompt .row{display:flex;gap:6px;margin-top:6px}
+.mcview{width:100%;height:auto;display:block;border-radius:6px;margin:6px 0}
+.mcpick{margin:0}

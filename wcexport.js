@@ -71,18 +71,25 @@ async function doDemux(blob) {
   const cw = vt.video?.width || entry.width, ch = vt.video?.height || entry.height;
   const res = { codec: vt.codec, description, codedWidth: cw, codedHeight: ch, rot, w: rot % 2 ? ch : cw, h: rot % 2 ? cw : ch,
     fps: vs.length > 1 ? (vs.length - 1) / Math.max(0.001, Math.max(...vs.map(s => s.cts))) : 30, samples: vs, blob, audio: null };
-  const at = info.audioTracks[0];
+  // iPhone .mov can carry several sound tracks (e.g. a 4-channel spatial 'apac' track next to stereo AAC) plus
+  // metadata ('mebx') and timecode tracks: use the AAC one, keep a list for diagnostics
+  res.audioTracks = info.audioTracks.map(t => ({ codec: t.codec, ch: t.audio?.channel_count, rate: t.audio?.sample_rate || t.timescale }));
+  const at = info.audioTracks.find(t => /^mp4a/.test(t.codec) && (t.audio?.channel_count || 2) <= 2) || info.audioTracks.find(t => /^mp4a/.test(t.codec)) || info.audioTracks[0];
   if (at) {
     const atrak = file.getTrackById(at.id), aen = atrak.mdia.minf.stbl.stsd.entries[0];
     // ISO mp4a carries esds directly; QuickTime-style (iPhone) mp4a v1 nests it in a 'wave' box
     const esds = aen.esds || aen.wave?.esds || (aen.boxes || []).flatMap(b => [b, ...(b.boxes || [])]).find(b => b.type === 'esds');
     let asc = esds?.esd?.descs?.[0]?.descs?.[0]?.data;
     if (!asc || !asc.length) { // synthesize an AAC-LC AudioSpecificConfig
-      const fi = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350].indexOf(at.audio?.sample_rate), ch = at.audio?.channel_count || 2;
+      // QuickTime sound description v2 stores the rate as a float elsewhere, so sample_rate can read as 0/1/65536:
+      // the media timescale is the sample rate for AAC in practice
+      const SR = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+      const fi = SR.includes(at.audio?.sample_rate) ? SR.indexOf(at.audio.sample_rate) : SR.indexOf(at.timescale), ch = Math.min(2, at.audio?.channel_count || 2);
       asc = fi >= 0 ? [(2 << 3) | (fi >> 1), ((fi & 1) << 7) | (ch << 3)] : null;
     }
     const as = file.getTrackSamplesInfo(at.id), atsc = at.timescale;
-    res.audio = { codec: at.codec, sampleRate: at.audio?.sample_rate, channels: at.audio?.channel_count, asc: asc ? new Uint8Array(asc) : null,
+    const SRS = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    res.audio = { codec: at.codec, sampleRate: SRS.includes(at.audio?.sample_rate) ? at.audio.sample_rate : (SRS.includes(at.timescale) ? at.timescale : at.audio?.sample_rate), channels: at.audio?.channel_count, asc: asc ? new Uint8Array(asc) : null,
       samples: as.map(s => ({ cts: s.cts / atsc, dur: s.duration / atsc, offset: s.offset, size: s.size })) };
     // encoder priming the edit list hides (AAC: 1024 / 2112 samples); needed to line up raw decoded audio
     const mt = atrak.edts?.elst?.entries?.[0]?.media_time;

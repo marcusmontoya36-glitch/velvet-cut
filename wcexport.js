@@ -6,7 +6,7 @@
 // Exports with no visual changes are stream-copied without any re-encode (remux).
 import { createFile, DataStream, Endianness, MP4BoxBuffer } from './vendor/webcodecs/mp4box.js';
 import { Muxer, ArrayBufferTarget } from './vendor/webcodecs/mp4-muxer.js';
-import { outputSize, xfadeDurations, clipDur, fwdDur, clipSpeed, srcAt, camP, clipColor, drawCaption, hasWarp, hasFish, programAudio } from './render.js';
+import { shadowAmt, outputSize, xfadeDurations, clipDur, fwdDur, clipSpeed, srcAt, camP, clipColor, drawCaption, hasWarp, hasFish, programAudio } from './render.js';
 import { createFx } from './fx.js';
 
 const FPS = 30, SR = 48000;
@@ -305,7 +305,7 @@ function needsNoRender(proj, opts) {
   if ((p.b || 0) !== 0 || (p.c ?? 1) !== 1 || (p.s ?? 1) !== 1 || p.w) return false;
   if (opts.burnCaptions && (proj.captions || []).some(c => c.text)) return false;
   if (proj.clips.length > 1 && (+proj.xfade || 0) > 0) return false;
-  return proj.clips.every(c => !c.enh && !c.boom && !c.audioFrom && clipSpeed(c) >= 0.999 && !c.muted && (!c.cam || (c.cam.z0 <= 1.001 && c.cam.z1 <= 1.001 && !c.cam.flip && !hasWarp(c.cam) && !hasFish(c.cam))));
+  return proj.clips.every(c => !c.enh && !shadowAmt(c) && !c.boom && !c.audioFrom && clipSpeed(c) >= 0.999 && !c.muted && (!c.cam || (c.cam.z0 <= 1.001 && c.cam.z1 <= 1.001 && !c.cam.flip && !hasWarp(c.cam) && !hasFish(c.cam))));
 }
 export async function canRemux(proj, media, opts) {
   if (!needsNoRender(proj, opts)) return false;
@@ -402,7 +402,7 @@ export function createWcExport(proj, media, opts = {}) {
     };
     const drawClip = async (i, l, alpha, gain, layer) => {
       const c = clips[i], dm = dms.get(c.mediaId), sp = clipSpeed(c), F = fwdDur(c);
-      const look = { alpha, gain, layer, rot: dm.rot, color: clipColor(proj, c), warm, sharp: c.enh?.sh ? 0.35 : 0 };
+      const look = { alpha, gain, layer, rot: dm.rot, color: clipColor(proj, c), warm, sharp: c.enh?.sh ? 0.35 : 0, shadow: shadowAmt(c) };
       const p = camP(c, l), ts = srcAt(c, l);
       if (c.boom && l > F + 0.5 / FPS) { // reverse half: frames kept from the forward half
         const arr = booms.get(i) || []; if (!arr.length) return;

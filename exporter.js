@@ -1,6 +1,6 @@
 // Export engines: (1) ffmpeg.wasm (single-thread, no special headers needed), (2) real-time canvas + MediaRecorder.
 import { FFmpeg } from './vendor/ffmpeg/index.js';
-import { cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish, programAudio } from './render.js';
+import { shadowAmt, shadowFF, cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish, programAudio } from './render.js';
 import { createFx } from './fx.js';
 
 let ff = null;
@@ -218,7 +218,7 @@ export function createRealtimeExport(proj, media, opts) {
       ctx.save();
       ctx.globalAlpha = alpha;
       if (hasFilter) ctx.filter = cssFilter(clipColor(proj, c));
-      if (fx && fx.draw(src, sw, sh, c.cam || null, p)) ctx.drawImage(fx.canvas, 0, 0, W, H);
+      if (fx && fx.draw(src, sw, sh, c.cam || null, p, { shadow: shadowAmt(c) })) ctx.drawImage(fx.canvas, 0, 0, W, H);
       else {
         if (c.cam?.flip) { ctx.translate(W, 0); ctx.scale(-1, 1); }
         const { z, cx, cy } = camAt(c.cam || null, p);
@@ -411,6 +411,11 @@ export async function exportChunked(proj, media, opts) {
     if (c.enh?.stab) v.push('deshake=rx=32:ry=32:edge=mirror');
     const F = fwdDur(c);
     if (cam) v.push(camFF(cam, boom ? F : d[clips.indexOf(c)], boom ? 0 : start, W, H, FPS)); else if (NW !== W) v.push(`scale=${W}:${H}`);
+    const shd = shadowAmt(c);
+    if (shd > 0) { // shadow recovery (same maths as the WebGL shader) at output size, base grid scaled to the camera zoom
+      fc.push(v.join(',') + `[shi${tag}]`); fc.push(...shadowFF(shd, W, H, `shi${tag}`, `sho${tag}`, cam ? (cam.z0 + cam.z1) / 2 : 1));
+      v.length = 0; v.push(`[sho${tag}]null`);
+    }
     const wf = c.cam ? warpFF(c.cam, W, H) : ''; if (wf) v.push(wf);
     if (c.cam?.flip) v.push('hflip');
     const en = enhFF(proj, c); if (en) v.push(en);

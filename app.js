@@ -1,5 +1,5 @@
 import * as DB from './db.js';
-import { cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut, programAudio } from './render.js';
+import { shadowAmt, cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut, programAudio } from './render.js';
 import { audioFeatures, groupClips, planMulticam, camsCovering } from './multicam.js';
 import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
@@ -264,7 +264,7 @@ function fxDraw(el, c, p, src) {
   const w = Math.min(1280, Math.round(st.clientWidth * dpr)), h = Math.round(w * st.clientHeight / Math.max(1, st.clientWidth));
   if (o.cv.width !== w || o.cv.height !== h) { o.cv.width = w; o.cv.height = h; }
   src = src || el;
-  const ok = o.fx.draw(src, src.videoWidth || src.width, src.videoHeight || src.height, c.cam, p);
+  const ok = o.fx.draw(src, src.videoWidth || src.width, src.videoHeight || src.height, c.cam, p, { shadow: shadowAmt(c) });
   const f = cssFilter(clipColor(S.proj, c)); if (o.cv.style.filter !== f) o.cv.style.filter = f;
   o.cv.style.zIndex = el.style.zIndex || getComputedStyle(el).zIndex || 0;
   if (ok !== o.on) { o.on = ok; setOp(el, el._op ?? +(el.style.opacity || 1)); }
@@ -375,8 +375,8 @@ function lookFor(el, c, p, src) {
   const f = cssFilter(clipColor(S.proj, c));
   if (el.style.filter !== f) el.style.filter = f;
   el.style.transform = c.cam ? camCss(c.cam, p, el.clientWidth || 1600, el.clientHeight || 900) : '';
-  // fisheye (and boomerang reverse frames) need WebGL; everything else is a CSS transform on the <video>
-  if ((hasFish(c.cam) || src) && fxDraw(el, c, p, src)) return;
+  // fisheye, shadow recovery (and boomerang reverse frames) need WebGL; everything else is a CSS transform on the <video>
+  if ((hasFish(c.cam) || src || shadowAmt(c) > 0) && fxDraw(el, c, p, src)) return;
   fxOff(el);
 }
 function applyLook() {
@@ -574,6 +574,10 @@ function renderClipInspector() {
   $('#ciLens').value = c.cam?.roll && c.cam?.fish ? 'both' : c.cam?.roll ? 'dutch' : c.cam?.fish ? 'fish' : 'none'; $('#ciLens').disabled = !c.cam;
   $('#ciSpeed').value = String(clipSpeed(c)); if ($('#ciSpeed').selectedIndex < 0) $('#ciSpeed').value = '1';
   $('#ciBoom').checked = !!c.boom;
+  const shv = Math.round(shadowAmt(c) * 100), shAuto = c.shadow == null;
+  if (document.activeElement !== $('#ciShadow')) $('#ciShadow').value = shv;
+  $('#ciShadowV').textContent = shAuto ? (c.enh?.shadow ? `Auto (${shv})` : 'Auto (off)') : String(shv);
+  $('#ciShadowAuto').checked = shAuto;
   renderMcPicker(c);
   const fo = c.focus || S.proj.focus?.[c.mediaId];
   $('#ciFocusInfo').textContent = fo ? `Focus set${fo.track?.length ? `, tracked over ${fo.track.length} frames` : ''}${c.focus ? ' (this shot only)' : ' (whole video)'}.` : 'No focus: crops follow motion and skin tone automatically.';
@@ -935,6 +939,11 @@ function bindFocus() {
     mutate(() => recam(c, c.cam.type, c.cam.flip, { ...lk, roll, fish })); seek(S.t); };
   $('#ciSpeed').onchange = (e) => { const c = selClip(); if (!c) return; const v = +e.target.value; mutate(() => { if (v >= 1) delete c.speed; else c.speed = v; }); seek(S.t); };
   $('#ciMcCam').onchange = (e) => { const c = selClip(); if (c) setClipCamera(c, e.target.value); };
+  // Shadows: drag = live preview, release = one undo step
+  let shDrag = null; // { had, prev } while dragging
+  $('#ciShadow').oninput = (e) => { const c = selClip(); if (!c) return; if (!shDrag) shDrag = { had: c.shadow != null, prev: c.shadow }; c.shadow = +e.target.value; $('#ciShadowV').textContent = e.target.value; $('#ciShadowAuto').checked = false; applyLook(); };
+  $('#ciShadow').onchange = (e) => { const c = selClip(); if (!c) return; const v = +e.target.value; if (shDrag) { if (shDrag.had) c.shadow = shDrag.prev; else delete c.shadow; } shDrag = null; mutate(() => { c.shadow = v; }); };
+  $('#ciShadowAuto').onchange = (e) => { const c = selClip(); if (!c) return; mutate(() => { if (e.target.checked) delete c.shadow; else c.shadow = Math.round(shadowAmt(c) * 100); }); };
   $('#ciBoom').onchange = (e) => { const c = selClip(); if (!c) return; mutate(() => { if (e.target.checked) c.boom = true; else delete c.boom; }); seek(S.t); };
   $('#exXf').onchange = (e) => { const v = parseXf(e.target.value); mutate(() => { S.proj.xfade = v.xfade; S.proj.xfadeType = v.xfadeType; }); };
 }
@@ -943,14 +952,14 @@ function bindFocus() {
 const CAM_NAMES = { 1: 'Subtle', 2: 'Medium', 3: 'Bold' };
 function readAutoUI() {
   return { order: $('#auOrder').value, xfade: $('#auXfade').value, strict: $('#auStrict').value, altAngle: $('#auAlt').checked,
-    color: $('#auColor').checked, denoise: $('#auDenoise').checked, sharpen: $('#auSharpen').checked, stabilize: $('#auStab').checked,
+    color: $('#auColor').checked, shadows: $('#auShadows').checked, denoise: $('#auDenoise').checked, sharpen: $('#auSharpen').checked, stabilize: $('#auStab').checked,
     camera: $('#auCam').checked, camLevel: +$('#auCamL').value,
     angles: $('#auAngles').checked, dutch: $('#auDutch').checked, fish: $('#auFish').value, extend: $('#auExtend').value, slowmo: $('#auSlow').value,
     multicam: $('#auMc').value, mcXfade: $('#auMcXf').value, mcPace: $('#auMcPace').value };
 }
 function writeAutoUI(st) {
   $('#auOrder').value = st.order; $('#auXfade').value = String(st.xfade); $('#auStrict').value = st.strict;
-  $('#auColor').checked = st.color; $('#auDenoise').checked = st.denoise; $('#auSharpen').checked = st.sharpen; $('#auStab').checked = st.stabilize;
+  $('#auColor').checked = st.color; $('#auShadows').checked = st.shadows !== false; $('#auDenoise').checked = st.denoise; $('#auSharpen').checked = st.sharpen; $('#auStab').checked = st.stabilize;
   $('#auCam').checked = st.camera; $('#auCamL').value = st.camLevel; $('#auCamV').textContent = CAM_NAMES[st.camLevel] || 'Medium';
   $('#auCamL').disabled = !st.camera; $('#auAlt').checked = !!st.altAngle;
   $('#auAngles').checked = !!st.angles; $('#auDutch').checked = !!st.dutch; $('#auFish').value = String(st.fish ?? '0');
@@ -967,7 +976,7 @@ function bindAuto() {
   $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
   $('#auExport').onclick = doExportAuto;
   $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
-  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace'].forEach(id => $(id).addEventListener('change', () => {
+  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace'].forEach(id => $(id).addEventListener('change', () => {
     const st = readAutoUI(); saveAutoSettings(st); $('#auCamL').disabled = !st.camera;
     if (S.analysis.size && S.proj.autoCuts && !S.autoJob) { $('#auStatus').textContent = 'Settings changed — re-editing…'; autoEdit(null); }
   }));
@@ -1057,7 +1066,7 @@ async function autoEdit(files) {
     else for (const s of shots) { delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType; }
     const newClips = shots.map((s, k) => {
       const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
-      const e = (st.color || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
+      const e = (st.color || st.shadows || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
       const o = { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}${s.ext === 'slow' ? ' · slow-mo' : s.ext === 'boom' ? ' · boomerang' : s.ext === 'replay' ? ' · replay' : ''}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
         enh: e, cam: st.camera ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
       if (s.speed && s.speed < 1) o.speed = s.speed;

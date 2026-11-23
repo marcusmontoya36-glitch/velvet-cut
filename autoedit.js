@@ -19,6 +19,7 @@ export const AUTO_DEFAULTS = {
   dutch: true,           // slight dutch tilt on some of the angled shots
   fish: '0.18',          // fisheye lens on some close / low shots: '0' off | '0.18' subtle | '0.32' strong
   extend: '0',           // '0' off | 'x1.5' | 'x2' | 't30' | 't60' (target seconds)
+  shadows: true,         // brighten dark areas: local shadow recovery (WebGL / ffmpeg, same maths)
   slowmo: 'fast',        // fast = frame blend (default, works with the hardware encoder) | smooth = motion-interpolated (ffmpeg, slow)
   multicam: 'auto',      // auto = find clips filmed at the same time (by sound) and cut between their angles | off
   mcXfade: '0.2',        // transition between cameras: '0' hard cut | '0.2' quick dissolve | '0.4'
@@ -198,21 +199,21 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
   let prevG = null, prevSig = null, prevHist = null;
   const measure = (d1, d2, dt, t, th) => {
     const g1 = toGray(d1, n), g2 = d2 === d1 ? g1 : toGray(d2, n);
-    let luma = 0, sat = 0, dark = 0, bright = 0, sd = 0;
+    let luma = 0, sat = 0, dark = 0, bright = 0, sd = 0, shad = 0;
     for (let i = 0, j = 0; j < n; i += 4, j++) {
-      luma += g1[j]; if (g1[j] < 24) dark++; if (g1[j] > 238) bright++;
+      luma += g1[j]; if (g1[j] < 24) dark++; if (g1[j] < 51) shad++; if (g1[j] > 238) bright++;
       const mx = Math.max(d1[i], d1[i + 1], d1[i + 2]), mn = Math.min(d1[i], d1[i + 1], d1[i + 2]);
       sat += mx ? (mx - mn) / mx : 0;
     }
     luma /= n; for (let j = 0; j < n; j++) sd += (g1[j] - luma) ** 2;
-    sd = Math.sqrt(sd / n) / 255; luma /= 255; sat /= n; dark /= n; bright /= n;
+    sd = Math.sqrt(sd / n) / 255; luma /= 255; sat /= n; dark /= n; bright /= n; shad /= n;
     const okDt = dt > 0.004 && dt < 0.6;
     const sh = okDt ? shift(g1, g2, AW, AH) : { dx: 0, dy: 0, resid: 0 };
     const sig = signature(g1, AW, AH), hs = hist(d1, n);
     const still = prevG ? sad(prevG, g1, AW, AH, 0, 0, 2) / 255 : null;
     const cut = prevSig ? Math.min(1, sigDiff(prevSig, sig) * 4) * 0.5 + Math.min(1, histDiff(prevHist, hs) * 2.5) * 0.5 : 0;
     const subj = subject(d1, g1, g2, AW, AH, sh);
-    out.push({ t: r2(t), dt: okDt ? dt : null, luma, sd, sat, dark, bright, lap: lapVar(g1, AW, AH),
+    out.push({ t: r2(t), dt: okDt ? dt : null, luma, sd, sat, dark, bright, shad, lap: lapVar(g1, AW, AH),
       vx: okDt ? sh.dx / AW / dt : null, vy: okDt ? sh.dy / AW / dt : null, resid: sh.resid, still, cut, sig, ...subj, thumb: th });
     prevG = g1; prevSig = sig; prevHist = hs;
     onTick && onTick(clamp((t - t0) / span, 0, 1));
@@ -301,11 +302,13 @@ const STRICT = {
 };
 
 /** Flag bad samples. lapRef = reference sharpness (median of sharp-ish samples across ALL clips). */
-function flagSamples(samples, lapRef, P) {
+function flagSamples(samples, lapRef, P, rescue = false) {
   for (const s of samples) {
     const r = []; s.soft = false;
-    if (s.lap < Math.max(P.blurAbs, lapRef * P.blur) && !(s.luma < P.dark)) r.push('blurry');
-    if (s.luma < P.dark || (s.dark > 0.75 && s.luma < P.dark * 1.8) || (s.luma < P.dark * 1.35 && s.sd < 0.08)) r.push('too dark');
+    if (s.lap < Math.max(P.blurAbs, lapRef * P.blur) && !(s.luma < (rescue ? P.dark * 1.6 : P.dark))) r.push('blurry'); // dim frames read soft
+    // with shadow recovery on, dim footage is brightened instead of cut: only near-black frames count as too dark
+    if (rescue) { if (s.luma < 0.035 || (s.dark > 0.92 && s.luma < 0.05)) r.push('too dark'); }
+    else if (s.luma < P.dark || (s.dark > 0.75 && s.luma < P.dark * 1.8) || (s.luma < P.dark * 1.35 && s.sd < 0.08)) r.push('too dark');
     if (s.luma > P.blown || s.bright > 0.55) r.push('blown out');
     if (s.shake > P.shake) r.push('shaky');
     s.bad = r;
@@ -353,7 +356,7 @@ export function planEdit(items, settings) {
     // blur reference = geometric mean of the global and this clip's sharpness, so a clip that is simply less
     // detailed (plain walls, soft light) isn't called blurry, but a clip much softer than the rest still is
     const clipLap = pct(it.samples.filter(s => s.luma > 0.12 && s.luma < 0.88).map(s => s.lap), 0.7) || lapRef;
-    flagSamples(it.samples, Math.sqrt(lapRef * clipLap), P);
+    flagSamples(it.samples, Math.sqrt(lapRef * clipLap), P, settings.shadows !== false);
     if (settings.skip?.has(it.mediaId)) continue; // multi-cam clips: flagged here, cut by the multi-cam planner
     const S = it.samples, h = it.step / 2;
     const bounds = (k) => [clamp(S[k].t - h, it.in, it.out), clamp(S[k].t + h, it.in, it.out)];
@@ -431,6 +434,19 @@ export function enhanceFor(samples, settings) {
   }
   if (settings.denoise) e.dn = L < 0.3 ? 2 : 1;          // darker footage is noisier
   if (settings.sharpen) e.sh = 1;
+  if (settings.shadows !== false) {
+    // shadow fraction = share of pixels darker than 20 % luma (older cached analyses: estimated from very-dark share)
+    const F = ss.reduce((a, s) => a + (s.shad ?? clamp(s.dark * 1.6 + (0.35 - s.luma), 0, 1)), 0) / Math.max(1, ss.length);
+    const k = clamp((F - 0.2) / 0.5, 0, 0.85) * (L < 0.6 ? 1 : 0.6);
+    e.shadowFrac = +F.toFixed(3);
+    if (k >= 0.08) {
+      e.shadow = +k.toFixed(2);
+      // the lift does the brightening in the darks: keep the global boost small so highlights don't clip,
+      // and soften extra contrast (it would push the lifted shadows back down)
+      e.b = Math.min(e.b, 0.12);
+      if (e.c > 1) e.c = +(1 + (e.c - 1) * (1 - 0.6 * e.shadow)).toFixed(2);
+    }
+  }
   return e;
 }
 

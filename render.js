@@ -270,3 +270,80 @@ export function cropToOut(cam, x, y, aspect = 16 / 9) {
   for (let i = 0; i < 12; i++) { const [a, b] = outToCrop(cam, u, v, aspect); u += x - a; v += y - b; }
   return [u, v];
 }
+
+// ---------- shadow recovery (local, luminance-masked lift) — shared by preview, fast export and ffmpeg ----------
+// One definition, three implementations (fx.js shader, shadowFF below, shadowRef for tests):
+//   Y  = BT.709 luma of the pixel, Q = sqrt(Y)
+//   B  = local mean of Q: area-average Q onto a 64-texel-wide grid, gaussian blur (σ = 1 texel), bilinear upsample
+//   M  = mix(B, Q, smoothstep(0.04, 0.16, |Q - B|))^2   (edge-aware base: no halos around bright/dark edges)
+//   w  = 1 - smoothstep(0.30, 0.75, M)                    (highlight protection: bright areas are left alone)
+//   fM = mix(M, M^(1-0.6s), w);  kb = min(fM / max(M, .004), 1 + 3s)   (gamma lift of the local base)
+//   k  = clamp(kb * ((Y+.02)/(M+.02))^(0.25 s w), 0.5, 4)  (mild local contrast, CLAHE-like, only where lifted)
+//   cd = mix(c, avg5(c), clamp((k-1)/4, 0, 0.6))          (light denoise where shadows were lifted)
+//   k' = min(k, max(1, PEAK / P)), P = max(R,G,B)          highlight guard: never lifts any channel past PEAK, so
+//                                                          skin/warm tones don't clip red and shift hue (leaves headroom for the grade)
+//   out = clamp(cd * k')
+// Multiplying R, G and B by the same k keeps hue and skin tones (no colour cast).
+export const SHADOW_BASE = 64;
+export const shadowAmt = (c) => {
+  const v = c?.shadow != null ? c.shadow / 100 : (c?.enh?.shadow || 0);
+  return Math.max(0, Math.min(1, +v || 0));
+};
+export const SHADOW_PEAK = 0.8; // headroom for the auto grade after the lift (brightness x1.12, contrast 1.15)
+export function shadowK(s, Y, B, P = Y) {
+  const Q = Math.sqrt(Math.max(0, Y)), e = Math.max(0, Math.min(1, (Math.abs(Q - B) - 0.04) / 0.12)), a = e * e * (3 - 2 * e);
+  const M = Math.pow(B + (Q - B) * a, 2);
+  const gam = 1 - 0.6 * s, kMax = 1 + 3 * s, lc = 0.25 * s;
+  const t = Math.max(0, Math.min(1, (M - 0.3) / 0.45)), w = 1 - t * t * (3 - 2 * t);
+  const fM = M * (1 - w) + Math.pow(Math.max(M, 1e-4), gam) * w;
+  const kb = Math.min(fM / Math.max(M, 0.004), kMax);
+  const k = Math.max(0.5, Math.min(4, kb * Math.pow((Y + 0.02) / (M + 0.02), lc * w)));
+  return Math.min(k, Math.max(1, SHADOW_PEAK / Math.max(P, 0.001)));
+}
+export const shadowBaseSize = (w, h) => w >= h ? [SHADOW_BASE, Math.max(4, Math.round(SHADOW_BASE * h / w))] : [Math.max(4, Math.round(SHADOW_BASE * w / h)), SHADOW_BASE];
+/**
+ * ffmpeg filtergraph lines for the same shadow lift on a W×H frame: [inL] -> [outL] (yuv420p in and out).
+ * 8-bit LUT based (lut / lut2 / maskedmerge / convolution), so it stays fast in ffmpeg.wasm.
+ */
+export function shadowFF(s, W, H, inL, outL, zoom = 1) {
+  const gam = (1 - 0.6 * s).toFixed(4), kMax = (1 + 3 * s).toFixed(4), lc = (0.25 * s).toFixed(4);
+  // zoom: the frame is a crop (1/zoom) of the source, so the base grid is coarser to cover the same source area
+  const [bw0, bh0] = shadowBaseSize(W, H), bw = Math.max(4, Math.round(bw0 / zoom)), bh = Math.max(4, Math.round(bh0 / zoom)), id = outL.replace(/\W/g, '');
+  // Works in YUV: scaling R,G,B by k == scaling (Y-16) and (Cb-128), (Cr-128) by k, so no RGB round trip.
+  // Y here is the BT.709 luma of the frame: (Y-16)/219. x = Y (tv range), y = base B (0..255 -> 0..1)
+  const Yn = 'clip((x-16)/219,0,1)';
+  const kExpr = `st(6,${Yn});st(7,sqrt(ld(6)));st(9,clip((abs(ld(7)-y/255)-0.04)/0.12,0,1));st(8,ld(9)*ld(9)*(3-2*ld(9)));` +
+    `st(0,pow(y/255+(ld(7)-y/255)*ld(8),2));st(9,clip((ld(0)-0.3)/0.45,0,1));st(1,1-ld(9)*ld(9)*(3-2*ld(9)));` +
+    `st(2,min((ld(0)*(1-ld(1))+pow(max(ld(0),0.0001),${gam})*ld(1))/max(ld(0),0.004),${kMax}));` +
+    `st(3,clip(ld(2)*pow((ld(6)+0.02)/(ld(0)+0.02),${lc}*ld(1)),0.5,4));` +
+    `ld(3)/4*255`;
+  const k = '(y*4/255)';
+  return [
+    `[${inL}]format=yuv420p,split=3[${id}v][${id}c][${id}pc]`,
+    `[${id}c]extractplanes=y,split=2[${id}y0][${id}y1]`,
+    `[${id}y1]lut=c0='sqrt(clip((val-16)/219,0,1))*255',scale=${bw}:${bh}:flags=area,gblur=sigma=1:steps=3,scale=${W}:${H}:flags=bilinear[${id}q]`,
+    `[${id}y0][${id}q]lut2=c0='${kExpr}'[${id}kr]`,
+    // peak channel P = max(R,G,B) from Y/Cb/Cr (BT.709, tv range) at chroma resolution, for the highlight guard
+    `[${id}pc]extractplanes=y+u+v[${id}py][${id}pu][${id}pv]`,
+    `[${id}py]scale=${W >> 1}:${H >> 1}:flags=area,split=3[${id}py0][${id}py1][${id}py2]`,
+    `[${id}pu]split=2[${id}pu0][${id}pu1]`, `[${id}pv]split=2[${id}pv0][${id}pv1]`,
+    `[${id}py0][${id}pv0]lut2=c0='clip((x-16)/219+1.5748*(y-128)/224,0,1)*255'[${id}pr]`,
+    `[${id}py1][${id}pu0]lut2=c0='clip((x-16)/219+1.8556*(y-128)/224,0,1)*255'[${id}pb]`,
+    `[${id}pu1][${id}pv1]lut2=c0='clip(128-0.1873*(x-128)*255/224-0.4681*(y-128)*255/224,0,255)'[${id}go]`,
+    `[${id}py2][${id}go]lut2=c0='clip((x-16)/219+(y-128)/255,0,1)*255'[${id}pg]`,
+    `[${id}pr][${id}pb]blend=all_mode=lighten[${id}prb]`,
+    `[${id}prb][${id}pg]blend=all_mode=lighten,scale=${W}:${H}:flags=bilinear[${id}pk]`,
+    `[${id}kr][${id}pk]lut2=c0='min(x*4/255,max(1,${SHADOW_PEAK}/max(y/255,0.001)))/4*255',split=2[${id}k0][${id}k1]`,
+    // stay in 4:2:0: chroma planes get a half-size copy of the gain/mask maps
+    `[${id}k0]lut=c0='clip((val*4/255-1)/4,0,0.6)*255',split=2[${id}w0][${id}wh]`,
+    `[${id}wh]scale=${W >> 1}:${H >> 1}:flags=area,split=2[${id}w1][${id}w2]`,
+    `[${id}w0][${id}w1][${id}w2]mergeplanes=0x001020:yuv420p[${id}w]`,
+    `[${id}k1]split=2[${id}ka][${id}kh]`,
+    `[${id}kh]scale=${W >> 1}:${H >> 1}:flags=area,split=2[${id}kb][${id}kc]`,
+    `[${id}ka][${id}kb][${id}kc]mergeplanes=0x001020:yuv420p[${id}k]`,
+    `[${id}v]split=2[${id}s0][${id}s1]`,
+    `[${id}s1]convolution=0m='0 1 0 1 1 1 0 1 0':1m='0 1 0 1 1 1 0 1 0':2m='0 1 0 1 1 1 0 1 0':0rdiv=0.2:1rdiv=0.2:2rdiv=0.2[${id}bl]`,
+    `[${id}s0][${id}bl][${id}w]maskedmerge[${id}cd]`,
+    `[${id}cd][${id}k]lut2=c0='clip(16+(x-16)*${k},16,235)':c1='clip(128+(x-128)*${k},16,240)':c2='clip(128+(x-128)*${k},16,240)'[${outL}]`,
+  ];
+}

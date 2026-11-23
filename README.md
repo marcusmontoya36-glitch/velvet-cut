@@ -88,6 +88,25 @@ The fast path skips denoise/stabilize; boomerang reverse frames are cached at �
 encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color,
 camera moves and crossfades, but not denoise or sharpen.
 
+## 🌗 Shadow recovery (brighten dark areas)
+Dark corners and underexposed clips get a local shadow lift. **⚡ Auto Edit** measures each clip's shadow fraction
+(share of luma below 20 %) and applies it automatically (Auto Edit settings → **🌗 Brighten dark areas**, on by default).
+Per clip: **Clip tab → Shadows** (0–100) with an **Auto shadows** box (shows `Auto (n)`; untick it to set your own value, 0 = off).
+
+How it works (identical model in the preview, the fast WebCodecs export and the ffmpeg.wasm fallback):
+- A coarse local-brightness map (64-cell grid of √luma, blurred; edge-aware so bright/dark edges don't halo) decides
+  what counts as "a dark area". Pixels in dark areas get a gamma lift on the lows plus mild CLAHE-style local contrast.
+- The lift multiplies R, G and B by the same gain, so hue doesn't change and skin stays natural (no colour cast).
+  Highlights are protected: no channel is lifted past 80 %, which leaves room for the auto grade so nothing clips.
+- Lifted shadows get a slight 5-tap denoise in proportion to the gain, so sensor noise doesn't turn into blotches.
+- Preview and fast export run it as a WebGL shader (two tiny passes build the map). ffmpeg does the same in YUV with
+  8-bit LUTs (`lut`/`lut2`/`maskedmerge`) on 4:2:0 planes.
+- When the lift is on, Auto Edit's "too dark" cut only drops near-black frames, and dim frames aren't flagged blurry.
+
+Measured on synthetic underexposed 720p clips (gamma 1.9 ×0.6 + noise), auto strength 85: luma of shadow pixels
+7–15 → 46–53 /255, frame mean 25–34 → 76–83, highlight clipping 0 % → ≤ 0.07 %. Normally exposed clips get 0–20.
+Export cost on the test box: fast path +8–27 %, ffmpeg.wasm +49 %.
+
 ## 🎥 Multi-cam (same moment, several phones/angles)
 Upload several clips filmed at the same time from different spots and run **⚡ Auto Edit**. The app finds which clips
 belong together, lines them up on one shared timeline, and cuts between the cameras.
@@ -167,6 +186,10 @@ Nothing is sent unless you press a hook button and confirm the upload dialog.
 - Browser storage can be evicted if the device runs low on space; the app requests persistent storage,
   but keep originals elsewhere. Clearing Safari website data deletes projects.
 - Live dictate needs a microphone and works best in a quiet room.
+- Shadow recovery: very dark footage is noisy and lifting it shows the noise (the denoise is light on purpose). Pure
+  black (crushed) areas have nothing to recover. Under fisheye, keystone, or a zoom that changes inside a clip, the ffmpeg path uses the clip's
+  average zoom for the brightness grid, so its result can differ slightly from the preview. GL vs ffmpeg typically differ by ~2/255.
+  The ffmpeg path assumes BT.709 colour. The real-time export (Export tab) applies the lift only where WebGL is available.
 - No free multi-track editing or music track yet (multi-cam uses one master sound track).
 
 ## AI enhance (fal.ai — wired)

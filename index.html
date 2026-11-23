@@ -111,6 +111,7 @@
         </select></label>
         <div class="checks">
           <label class="chk"><input type="checkbox" id="auColor"> Fix brightness / contrast / color</label>
+          <label class="chk"><input type="checkbox" id="auShadows"> 🌗 Brighten dark areas (shadow recovery)</label>
           <label class="chk"><input type="checkbox" id="auDenoise"> Denoise</label>
           <label class="chk"><input type="checkbox" id="auSharpen"> Sharpen</label>
           <label class="chk"><input type="checkbox" id="auStab"> Stabilize slightly shaky shots</label>
@@ -183,6 +184,8 @@
             <option value="none">Straight</option><option value="dutch">Dutch tilt</option><option value="fish">Fisheye</option><option value="both">Dutch + fisheye</option>
           </select></label>
           <label id="ciMcRow" hidden>🎥 Camera (multi-cam)<select id="ciMcCam"></select></label>
+          <label>🌗 Shadows: <b id="ciShadowV">Auto</b><input id="ciShadow" type="range" min="0" max="100" step="1" value="0"></label>
+          <label class="chk"><input type="checkbox" id="ciShadowAuto" checked> Auto shadows</label>
           <label>Speed<select id="ciSpeed">
             <option value="1">Normal</option><option value="0.75">Slow 0.75×</option><option value="0.5">Slow-mo 0.5×</option><option value="0.33">Super slow 0.33×</option>
           </select></label>

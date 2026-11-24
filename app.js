@@ -4,7 +4,8 @@ import { audioFeatures, groupClips, planMulticam, camsCovering, addAngleReplays,
 import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
 import { canRemux, remuxExport, wcBlocker, createWcExport } from './wcexport.js';
-import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue, lookOf, extendShots, editLength } from './autoedit.js';
+import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue, lookOf, extendShots, editLength, setFraming } from './autoedit.js';
+import { loadPose, poseStatus, fitCam, shotKeys, protectedOf, boxUnion, TIGHTNESS } from './framing.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
 import { loadAI, saveAI, HOOKS, providerReady, runHook } from './hooks.js';
 
@@ -346,6 +347,7 @@ function loop() {
     tickUI();
   }
   syncProgramAudio();
+  renderProtBox();
   requestAnimationFrame(loop);
 }
 // multi-cam preview: the sound comes from the master camera on a hidden <audio>, so it runs on through camera cuts
@@ -858,10 +860,68 @@ function downloadText(name, text) {
 // ---------------- Focus point + per-clip framing ----------------
 const camLevel = () => +($('#auCamL')?.value || 2);
 function subjForClip(c, a = c.in, b = c.out) {
-  return subjectFromFocus(c.focus || S.proj.focus?.[c.mediaId], a, b) || subjectOf(S.analysis.get(c.mediaId)?.samples, a, b);
+  return subjectFromFocus(c.focus || S.proj.focus?.[c.mediaId], a, b) || (keepFrameOn() && subjectFromProtected(c, a, b)) || subjectOf(S.analysis.get(c.mediaId)?.samples, a, b);
 }
 function recam(c, type = c.cam?.type, flip = c.cam?.flip, look = lookOf(c.cam)) {
   c.cam = !type || type === 'none' ? null : camFor(type, subjForClip(c), LEVELS[camLevel()] || LEVELS[2], !!flip, look);
+  if (c.cam) c.cam = fitFor(c, c.cam);
+}
+// ---- "Keep her in frame": protected region (her + the action + where the bodies meet) is always inside the virtual camera ----
+const keepFrameOn = () => loadAutoSettings().keepFrame !== false;
+// focus point (Set focus tap) for a video at source time t — picks which person is "her" and is remembered per video
+function focusAtFor(c) {
+  const fo = c.focus || S.proj.focus?.[c.mediaId]; if (!fo) return () => null;
+  return (t) => { const tr = fo.track || []; if (!tr.length) return { x: fo.x, y: fo.y };
+    const q = tr.reduce((m, k) => Math.abs(k.t - t) < Math.abs(m.t - t) ? k : m, tr[0]); return { x: q.x, y: q.y }; };
+}
+// source box (0..1 of the video) -> output frame (0..1), clips with another aspect are letterboxed into the first clip's frame
+function frameMap(mediaId) {
+  const m = S.media.get(mediaId), [W, H] = outputSize(clips().length ? clips() : [{ w: m?.w, h: m?.h }], 'src');
+  const [dx, dy, dw, dh] = containRect(m?.w || W, m?.h || H, W, H);
+  const f = (b) => b && [(dx + b[0] * dw) / W, (dy + b[1] * dh) / H, (dx + b[2] * dw) / W, (dy + b[3] * dh) / H];
+  return { f, aspect: W / H };
+}
+function keysFor(c, a = c.in, b = c.out) {
+  const sm = S.analysis.get(c.mediaId)?.samples; if (!sm?.length) return [];
+  const { f } = frameMap(c.mediaId);
+  return shotKeys(sm, a, b, focusAtFor(c)).map(k => ({ p: k.p, box: f(k.box) }));
+}
+function subjectFromProtected(c, a, b) {
+  const k = keysFor(c, a, b); if (!k.length) return null;
+  const ctr = (bx) => [(bx[0] + bx[2]) / 2, (bx[1] + bx[3]) / 2];
+  const U = (a) => a.reduce((u, x) => boxUnion(u, x.box), null), A = U(k.slice(0, 3)), B = U(k.slice(-3)); if (!A || !B) return null;
+  const [cx, cy] = ctr(A), [cx1, cy1] = ctr(B);
+  return { cx, cy, cx1, cy1, conf: 0.8 };
+}
+function fitFor(c, cam, st = loadAutoSettings()) {
+  if (!cam || st.keepFrame === false) return cam;
+  const keys = keysFor(c); if (!keys.length) return cam;
+  const T = TIGHTNESS[st.frameTight] || TIGHTNESS.balanced;
+  return fitCam(cam, keys, { margin: T.margin, zoomK: T.zoomK, aspect: frameMap(c.mediaId).aspect });
+}
+// preview overlay: the protected box drawn through the current camera
+function renderProtBox() {
+  const cv = $('#protBox'); if (!cv) return;
+  const on = $('#pvProt')?.checked, c = clips()[S.idx];
+  if (!on || !c) { if (!cv.hidden) { cv.hidden = true; } return; }
+  cv.hidden = false;
+  const st = $('#stage'), W = st.clientWidth, H = st.clientHeight;
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const g = cv.getContext('2d'); g.clearRect(0, 0, W, H);
+  const sm = S.analysis.get(c.mediaId)?.samples; if (!sm?.length) return;
+  const t = player.currentTime, fa = focusAtFor(c);
+  const near = sm.filter(x => Math.abs(x.t - t) <= 0.4); if (!near.length) return;
+  const box = near.reduce((u, x) => boxUnion(u, protectedOf(x, fa(x.t)).box), null); if (!box) return;
+  const pts = [];
+  for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push([box[0] + (box[2] - box[0]) * u, box[1]]); }
+  for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push([box[2], box[1] + (box[3] - box[1]) * u]); }
+  for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push([box[2] - (box[2] - box[0]) * u, box[3]]); }
+  for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push([box[0], box[3] - (box[3] - box[1]) * u]); }
+  let inside = true;
+  g.beginPath();
+  pts.forEach(([x, y], i) => { const [sx, sy] = contentToStage(x, y); if (sx < 0 || sx > 1 || sy < 0 || sy > 1) inside = false; i ? g.lineTo(sx * W, sy * H) : g.moveTo(sx * W, sy * H); });
+  g.closePath(); g.lineWidth = 2; g.setLineDash([6, 4]); g.strokeStyle = inside ? '#3ee08f' : '#ff4d6d'; g.stroke();
+  g.setLineDash([]); g.fillStyle = inside ? '#3ee08f' : '#ff4d6d'; g.font = '12px system-ui'; g.fillText(inside ? 'her + action ✓' : 'outside crop', 8, H - 10);
 }
 // stage (0..1) <-> video content (0..1), accounting for letterboxing, the current camera zoom and mirroring
 function stageGeom() {
@@ -956,7 +1016,8 @@ function readAutoUI() {
     color: $('#auColor').checked, shadows: $('#auShadows').checked, denoise: $('#auDenoise').checked, sharpen: $('#auSharpen').checked, stabilize: $('#auStab').checked,
     camera: $('#auCam').checked, camLevel: +$('#auCamL').value,
     angles: $('#auAngles').checked, dutch: $('#auDutch').checked, fish: $('#auFish').value, extend: $('#auExtend').value, slowmo: $('#auSlow').value,
-    multicam: $('#auMc').value, mcXfade: $('#auMcXf').value, mcPace: $('#auMcPace').value, mcReplay: $('#auMcReplay').value, mcReplaySlow: $('#auMcRSlow').checked };
+    multicam: $('#auMc').value, mcXfade: $('#auMcXf').value, mcPace: $('#auMcPace').value, mcReplay: $('#auMcReplay').value, mcReplaySlow: $('#auMcRSlow').checked,
+    keepFrame: $('#auKeep').checked, frameTight: $('#auTight').value };
 }
 function writeAutoUI(st) {
   $('#auOrder').value = st.order; $('#auXfade').value = String(st.xfade); $('#auStrict').value = st.strict;
@@ -967,6 +1028,8 @@ function writeAutoUI(st) {
   $('#auExtend').value = String(st.extend || '0'); $('#auSlow').value = st.slowmo || 'fast';
   $('#auMc').value = st.multicam || 'auto'; $('#auMcXf').value = String(st.mcXfade ?? '0.2'); $('#auMcPace').value = st.mcPace || 'normal';
   $('#auMcReplay').value = String(st.mcReplay ?? 'auto'); $('#auMcRSlow').checked = st.mcReplaySlow !== false;
+  $('#auKeep').checked = st.keepFrame !== false; $('#auTight').value = st.frameTight || 'balanced'; $('#auTight').disabled = st.keepFrame === false;
+  setFraming(st.keepFrame !== false);
 }
 function bindAuto() {
   writeAutoUI(loadAutoSettings());
@@ -978,8 +1041,8 @@ function bindAuto() {
   $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
   $('#auExport').onclick = doExportAuto;
   $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
-  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace', '#auMcReplay', '#auMcRSlow'].forEach(id => $(id).addEventListener('change', () => {
-    const st = readAutoUI(); saveAutoSettings(st); $('#auCamL').disabled = !st.camera;
+  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace', '#auMcReplay', '#auMcRSlow', '#auKeep', '#auTight'].forEach(id => $(id).addEventListener('change', () => {
+    const st = readAutoUI(); saveAutoSettings(st); setFraming(st.keepFrame !== false); $('#auCamL').disabled = !st.camera; $('#auTight').disabled = !st.keepFrame; setFraming(st.keepFrame);
     if (S.analysis.size && S.proj.autoCuts && !S.autoJob) { $('#auStatus').textContent = 'Settings changed — re-editing…'; autoEdit(null); }
   }));
 }
@@ -1016,10 +1079,14 @@ async function autoEdit(files) {
       if (m.capture == null) m.capture = m.captureMeta || m.blob.lastModified || null;
       let an = S.analysis.get(id);
       const ta = performance.now();
+      if (an && st.keepFrame !== false && !an.posed) an = null; // analysed before "Keep her in frame" was on: redo with people detection
       if (!an) {
-        an = await analyzeRange(m.url, 0, m.duration, { signal: ac.signal,
+        let pose = null;
+        if (st.keepFrame !== false) { auProg(0.9 * done / totalDur, 'Loading the people detector…'); pose = await loadPose(); }
+        an = await analyzeRange(m.url, 0, m.duration, { signal: ac.signal, pose,
           onTick: (f) => auProg(0.9 * (done + f * m.duration) / totalDur, `Analyzing clip ${i + 1} of ${mids.length}…`) });
         console.info(`[auto] analysed ${m.name} (${m.duration.toFixed(1)} s) in ${Math.round(performance.now() - ta)} ms via ${an.mode}, ${an.samples.length} samples`);
+        an.posed = st.keepFrame !== false;
         S.analysis.set(id, an);
       }
       done += m.duration;
@@ -1043,7 +1110,7 @@ async function autoEdit(files) {
     const units = plan.keep.map(s => ({ shots: [s], cap: (s.capture ?? Infinity) + s.in * 1000, order: s.order, in: s.in, score: s.score }));
     const mcCuts = [];
     for (const g of groups) {
-      const r = planMulticam(g, itemMap, { xfade: xf.xfade, pace: st.mcPace, lapRef: plan.lapRef, envOf: (id) => S.mcFeat.get(id)?.env, nudge: S.proj.mc?.nudge });
+      const r = planMulticam(g, itemMap, { framing: st.keepFrame !== false, xfade: xf.xfade, pace: st.mcPace, lapRef: plan.lapRef, envOf: (id) => S.mcFeat.get(id)?.env, nudge: S.proj.mc?.nudge });
       if (!r?.shots.length) continue;
       g.master = r.master;
       // every-angle replays: highlight moments played back to back from each camera, then the edit carries on
@@ -1071,7 +1138,8 @@ async function autoEdit(files) {
     const ext = extendShots(shots, st.extend, { xfade: xf.xfade, lapRef: plan.lapRef });
     shots = ext.shots;
     if (st.camera) shots = planCamera(shots, st.camLevel, { xfade: xf.xfade, altAngle: st.altAngle, angles: st.angles, dutch: st.dutch, fish: st.fish,
-      subjFn: (s, a, b) => subjectFromFocus(S.proj.focus?.[s.mediaId], a, b) });
+      subjFn: (s, a, b) => subjectFromFocus(S.proj.focus?.[s.mediaId], a, b) || (st.keepFrame !== false && subjectFromProtected(s, a, b)) || null,
+      fit: st.keepFrame !== false ? (s, cam) => fitFor(s, cam, st) : null });
     else for (const s of shots) { delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType; }
     const newClips = shots.map((s, k) => {
       const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
@@ -1566,4 +1634,4 @@ async function init() {
 init();
 
 // test/debug hooks
-window.VC = { S, importFiles, autoEdit, restoreCut, doExportAuto, splitAt, seek, play, pause, analyze, applySugg, addCaption, mutate, saveProject, openProject, doExportFF, doExportRT, total, showTab, renderAll };
+window.VC = { S, fitFor: (c, cam) => fitFor(c, cam), keysFor: (c) => keysFor(c), frameMap: (id) => frameMap(id), importFiles, autoEdit, restoreCut, doExportAuto, splitAt, seek, play, pause, analyze, applySugg, addCaption, mutate, saveProject, openProject, doExportFF, doExportRT, total, showTab, renderAll };

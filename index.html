@@ -52,6 +52,7 @@
         <div id="focusLayer" class="focuslayer"><div class="fhint">🎯 Tap her — zooms and moves will follow that spot</div></div>
         <div id="focusDot" class="focusdot" hidden></div>
         <div id="capLayer" class="caplayer"></div>
+        <canvas id="protBox" class="protbox" hidden></canvas>
         <div id="dropHint" class="drophint">
           <div>Drop videos here<br><small>mp4 · mov · webm — stays on this device</small></div>
           <button id="btnAuto2" class="primary">⚡ Auto Edit videos</button>
@@ -64,6 +65,7 @@
       <span id="tc" class="tc">0:00.0 / 0:00.0</span>
       <input id="scrub" type="range" min="0" max="0" step="0.01" value="0" aria-label="Playhead">
       <button id="btnMuteAll" title="Mute preview">🔊</button>
+      <label class="pvprot" title="Show the protected box (her + the action) the camera keeps in frame"><input type="checkbox" id="pvProt"> ▣</label>
     </div>
   </section>
 
@@ -116,6 +118,10 @@
           <label class="chk"><input type="checkbox" id="auSharpen"> Sharpen</label>
           <label class="chk"><input type="checkbox" id="auStab"> Stabilize slightly shaky shots</label>
         </div>
+        <label class="chk"><input type="checkbox" id="auKeep" checked> 👁 Keep her in frame (every zoom, angle and pan keeps her, her movement and the action fully visible)</label>
+        <label>Framing tightness<select id="auTight">
+          <option value="loose">Loose — lots of room, gentle zooms</option><option value="balanced" selected>Balanced</option><option value="tight">Tight — closer, smaller margin</option>
+        </select></label>
         <label class="chk"><input type="checkbox" id="auCam"> 🎥 Dynamic camera (zooms, punch-ins, pans, multi-angle feel)</label>
         <label>Camera intensity: <b id="auCamV">Medium</b><input id="auCamL" type="range" min="1" max="3" step="1" value="2"></label>
         <label class="chk"><input type="checkbox" id="auAlt"> Alt angles (occasional mirrored shots)</label>

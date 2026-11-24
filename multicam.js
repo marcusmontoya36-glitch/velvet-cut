@@ -436,9 +436,9 @@ export function planMulticam(group, items, opts = {}) {
   for (const c of cams) { const qs = (c.it.samples || []).map(x => quality(x, lapRef)).sort((a, b) => a - b); c.med = qs.length ? qs[qs.length >> 1] : 0.45; }
   const weak = (c, s) => badOf(c, s) || (s && quality(s, lapRef) < c.med - 0.12);
   const winScore = (c, a, b) => {
-    let sum = 0, n = 0, bad = 0;
-    for (let g = a; g <= b + 1e-6; g += 0.25) { const s = sAt(c, g); if (!s) continue; n++; sum += quality(s, lapRef); if (badOf(c, s)) bad++; }
-    return n ? { q: sum / n, bad: bad / n } : { q: c.med, bad: 0 };
+    let sum = 0, n = 0, bad = 0, fq = 0, nf = 0, am = 0, found = 0, ok = 0;
+    for (let g = a; g <= b + 1e-6; g += 0.25) { const s = sAt(c, g); if (!s) continue; n++; sum += quality(s, lapRef); if (badOf(c, s)) bad++; if (s.fq != null) { fq += s.fq; nf++; if (s.fq >= 0.5) ok++; } if (s.ppl?.length) found++; am += s.am || 0; }
+    return n ? { q: sum / n, bad: bad / n, fq: nf ? fq / nf : null, okF: nf ? ok / nf : 1, am: am / n, found } : { q: c.med, bad: 0, fq: null, okF: 1, am: 0, found: 0 };
   };
   const used = new Map(); let usedAll = 0;
   // master audio: the camera covering most of the group (ties: the one with the best average picture is not
@@ -464,13 +464,20 @@ export function planMulticam(group, items, opts = {}) {
   while (g < G1 - 0.6) {
     const want = pmin + (pmax - pmin) * rand();
     let best = null;
+    const cand = [];
     for (const c of cams) {
       if (!covers(c, g, g + Math.min(1, G1 - g - 0.1))) continue;
       const maxL = c.off + c.it.dur - 0.05 - g;
       const L = Math.min(want, maxL);
       if (L < Math.min(1, G1 - g - 0.1)) continue;
-      const w = winScore(c, g, g + L);
+      cand.push({ c, L, w: winScore(c, g, g + L) });
+    }
+    const amMax = Math.max(1e-6, ...cand.map(x => x.w.am));
+    const pplHere = opts.framing !== false && cand.some(x => x.w.found > 0);
+    for (const { c, L, w } of cand) {
       let sc = w.q + 2 * (w.q - c.med) - 1.2 * w.bad;
+      // keep her in frame: absolute preference for the angle that shows her and the action (not relative to its own baseline)
+      if (pplHere && w.fq != null) sc += 2.0 * (w.fq - 0.6) + 0.5 * (w.am / amMax - 0.6) - 1.6 * (1 - w.okF); // she is missing / badly framed on part of this window
       if (c === prev) sc -= run + L > pmax ? 1.0 : 0.35;           // keep switching
       const nCover = cams.filter(o => covers(o, g, g + 1)).length;
       sc += 0.6 * Math.max(0, 1 / nCover - (used.get(c.mediaId) || 0) / Math.max(1, usedAll)); // give every angle screen time

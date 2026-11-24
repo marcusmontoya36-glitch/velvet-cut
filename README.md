@@ -154,6 +154,42 @@ per clip. After every run the Auto tab says what it found: **“🎥 3 angles sy
 - Changing nudges or groups re-plans the edit and drops manual camera picks and manual replays.
 - Boomerangs and the real-time export use each camera's own sound.
 
+## 👁 Keep her in frame (subject-aware framing, v11)
+
+On by default (Auto → *Keep her in frame*). Every automatic camera move (punch-ins, push/pull, pans, above/below
+angles, dutch tilt, fisheye) is fitted so that a **protected region** stays fully visible with a margin:
+
+- **Who:** an on-device people detector (MediaPipe Pose Landmarker lite, runs in the browser, nothing uploaded)
+  finds up to 2 people in every analysed frame. People are tracked through the video; when two are in view, the one
+  moving most (motion per body area) is "her". There is no gender classifier, so if it picks the wrong person,
+  tap **🎯 Set focus** on her once: that person is used from then on (remembered per video).
+- **What is protected:** her whole body (incl. head/hair) ∪ the moving action next to her ∪ the zone where the two
+  bodies touch ∪ the other person's face when it is at her body (oral). If she is not detected in a frame (edge,
+  blur, occlusion), that frame protects everyone in view + all the movement. A box within 4 % of the frame edge,
+  or taller/wider than 85 % of the frame, is treated as continuing past the edge (no zoom may cut that side).
+- **How the camera is fitted:** the protected box is checked through the real crop → keystone/tilt → fisheye
+  mapping at 11 points of every shot (each point = union of boxes within ±0.4 s plus the two analysis samples around
+  it, so fast movement between samples is covered and the camera never chases jitter). Remedies in order: pan/tilt
+  the crop → a gentler zoom (largest zoom that still fits) → soften keystone/tilt/fisheye → full frame.
+- **Shot choice:** shots where she is missing, tiny or cut by the frame edge score lower; a stretch ≥ 1.5 s with
+  nobody in frame is cut as a bad part (only when the detector works on that clip). Multi-cam prefers the angle that
+  shows her and the action, and won't cut to an angle that loses her just to keep switching.
+- **Framing tightness:** Loose (12 % margin, gentler zooms) · Balanced (8 %, default) · Tight (5 %).
+- **▣ next to the volume button** draws the protected box over the preview (green = inside the shot, red = cut).
+- If the model can't load (offline first run, old browser) it falls back to motion + skin areas, which is more
+  conservative (fewer zooms).
+
+Test (synthetic footage with real cut-out people, ground-truth boxes): her box fully in frame on **100 %** of
+output frames in v11 vs **14.6 %** in v10 (camera Medium), 100 % vs 5.9 % (Bold + strong fisheye), multi-cam
+100 % vs 0 %. Analysis +~0.4 s per minute of footage on desktop (model load ~0.3 s, ~70 ms per analysed frame in
+WebKit); export speed unchanged.
+
+Limits: when she fills most of the frame or moves edge to edge within a shot, the camera stays wide (no punch-in /
+angle) because any crop would cut her: on close-up footage most automatic moves become full-frame shots.
+The detector can miss people in very dark, very close or unusual poses; those frames fall back to "protect
+everything moving". Manual camera picks in the Clip tab are fitted too while *Keep her in frame* is on.
+The model files (~15 MB) download on first use and are cached for offline use.
+
 ## Features
 
 | Area | What works |
@@ -238,12 +274,14 @@ db.js                                  IndexedDB (media blobs + projects)
 render.js                              shared caption/color drawing, SRT helpers
 exporter.js                            ffmpeg.wasm export + real-time MediaRecorder export
 wcexport.js                            fast export: remux, WebCodecs decode/render/encode, mp4 muxing
+framing.js                             keep-her-in-frame: people detection, protected region, camera fitting
 multicam.js                            multi-cam: audio sync (onset xcorr + GCC-PHAT), grouping, camera switching plan
 fx.js                                  WebGL renderer (camera, angles, fisheye, color, blend) shared by preview + exports
 ai.js                                  silence/motion/black detection, auto color, transcript timing
 hooks.js                               optional cloud/self-hosted enhance hooks
 sw.js  manifest.webmanifest  icons/    PWA
 vendor/webcodecs/                      mp4box.js 2.6.0 (BSD-3) + mp4-muxer 5.2.2 (MIT)
+vendor/mediapipe/                      @mediapipe/tasks-vision (vision_bundle + wasm) + pose_landmarker_lite.task (Apache-2.0)
 vendor/ffmpeg/                         @ffmpeg/ffmpeg 0.12.15 + @ffmpeg/core 0.12.10 (single-thread, LGPL/GPL — see their licenses)
 shots/                                 UI screenshots
 ```

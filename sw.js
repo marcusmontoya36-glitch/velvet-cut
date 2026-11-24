@@ -1,8 +1,8 @@
 // Offline cache for the app shell + ffmpeg engine. User media never goes through here (blob: URLs).
 // The 31 MB ffmpeg core lives in its own cache bucket (vc-core-v1) so app updates don't re-download it.
-const V = 'vc-v10';
+const V = 'vc-v11';
 const CORE = 'vc-core-v1';
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'render.js', 'fx.js', 'wcexport.js', 'multicam.js', 'vendor/webcodecs/mp4box.js', 'vendor/webcodecs/mp4-muxer.js', 'exporter.js', 'ai.js', 'autoedit.js', 'hooks.js', 'manifest.webmanifest',
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'db.js', 'render.js', 'fx.js', 'wcexport.js', 'multicam.js', 'framing.js', 'vendor/mediapipe/vision_bundle.mjs', 'vendor/webcodecs/mp4box.js', 'vendor/webcodecs/mp4-muxer.js', 'exporter.js', 'ai.js', 'autoedit.js', 'hooks.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'vendor/blank.mp4', 'vendor/ffmpeg/index.js', 'vendor/ffmpeg/classes.js', 'vendor/ffmpeg/const.js',
   'vendor/ffmpeg/errors.js', 'vendor/ffmpeg/types.js', 'vendor/ffmpeg/utils.js', 'vendor/ffmpeg/worker.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(V).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
@@ -19,7 +19,7 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (e.request.method !== 'GET' || u.origin !== location.origin) return;
-  if (u.pathname.includes('/vendor/ffmpeg/core/')) {
+  if (u.pathname.includes('/vendor/ffmpeg/core/') || (u.pathname.includes('/vendor/mediapipe/') && !u.pathname.endsWith('.mjs'))) {
     // cache-first for the big wasm engine
     e.respondWith(caches.open(CORE).then(c => c.match(e.request, { ignoreSearch: true }).then(r => r || fetch(e.request).then(res => { if (res.ok) c.put(e.request, res.clone()); return res; }))));
   } else {

@@ -3,6 +3,7 @@
 // Everything runs in the browser by seeking a hidden <video> and reading small canvas frames,
 // so memory stays flat no matter how long the clip is (it never loads the whole file).
 
+import { actionBox, detectPeople, framingScore, assignTargets } from './framing.js';
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const r2 = (x) => Math.round(x * 100) / 100;
 const median = (a) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
@@ -17,6 +18,8 @@ export const AUTO_DEFAULTS = {
   camera: true, camLevel: 2, altAngle: false, // camLevel 1 subtle, 2 medium, 3 bold
   angles: true,          // simulated high (from above) / low (from below) angles mixed into the rotation
   dutch: true,           // slight dutch tilt on some of the angled shots
+  keepFrame: true,       // "Keep her in frame": every camera move keeps her + the action inside the crop
+  frameTight: 'balanced', // loose | balanced | tight (margin around her)
   fish: '0.18',          // fisheye lens on some close / low shots: '0' off | '0.18' subtle | '0.32' strong
   extend: '0',           // '0' off | 'x1.5' | 'x2' | 't30' | 't60' (target seconds)
   shadows: true,         // brighten dark areas: local shadow recovery (WebGL / ffmpeg, same maths)
@@ -191,7 +194,7 @@ async function setSrc(v, url) {
  * can measure camera motion. Fallback: seek sampling with short timeouts. A watchdog guarantees it never hangs.
  * Returns {samples, step, mode}.
  */
-export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 240, perSec = 2, rate = 8 } = {}) {
+export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 240, perSec = 2, rate = 8, pose = null } = {}) {
   const v = analysisVideo();
   await setSrc(v, url);
   const span = Math.max(0.1, t1 - t0);
@@ -203,10 +206,14 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
   const tctx = tc.getContext('2d');
   const n = AW * AH;
   const grab = () => { ctx.drawImage(v, 0, 0, AW, AH); return ctx.getImageData(0, 0, AW, AH).data; };
+  // people (pose model) on a 256-px copy of the same frame; null = model not available
+  const PW = 256, PH = Math.round(PW * AH / AW);
+  const pcv = pose ? document.createElement('canvas') : null; if (pcv) { pcv.width = PW; pcv.height = PH; }
+  const people = () => { if (!pose) return null; try { pcv.getContext('2d').drawImage(v, 0, 0, PW, PH); return detectPeople(pose, pcv); } catch { return null; } };
   const thumb = () => { tctx.drawImage(cv, 0, 0, tc.width, tc.height); return tc.toDataURL('image/jpeg', 0.55); };
   const out = [];
   let prevG = null, prevSig = null, prevHist = null;
-  const measure = (d1, d2, dt, t, th) => {
+  const measure = (d1, d2, dt, t, th, ppl = null) => {
     const g1 = toGray(d1, n), g2 = d2 === d1 ? g1 : toGray(d2, n);
     let luma = 0, sat = 0, dark = 0, bright = 0, sd = 0, shad = 0;
     for (let i = 0, j = 0; j < n; i += 4, j++) {
@@ -222,6 +229,9 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
     const still = prevG ? sad(prevG, g1, AW, AH, 0, 0, 2) / 255 : null;
     const cut = prevSig ? Math.min(1, sigDiff(prevSig, sig) * 4) * 0.5 + Math.min(1, histDiff(prevHist, hs) * 2.5) * 0.5 : 0;
     const subj = subject(d1, g1, g2, AW, AH, sh);
+    const ab = actionBox(d1, g1, g2, AW, AH, sh);
+    if (ab) { subj.ab = ab.box; subj.am = ab.mot; if (ab.mbox) subj.mb = ab.mbox; subj.mg = ab.mg; }
+    if (ppl) subj.ppl = ppl;
     out.push({ t: r2(t), dt: okDt ? dt : null, luma, sd, sat, dark, bright, shad, lap: lapVar(g1, AW, AH),
       vx: okDt ? sh.dx / AW / dt : null, vy: okDt ? sh.dy / AW / dt : null, resid: sh.resid, still, cut, sig, ...subj, thumb: th });
     prevG = g1; prevSig = sig; prevHist = hs;
@@ -242,12 +252,12 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
       if (mt <= last + 1e-4) return;
       last = mt; lastProg = performance.now();
       try {
-        if (pend) { const d2 = grab(); measure(pend.d, d2, mt - pend.t, pend.t, pend.th); pend = null; }
-        else if (mt >= next && mt < t1) { pend = { d: grab(), t: mt }; pend.th = thumb(); while (next <= mt) next += step; }
+        if (pend) { const d2 = grab(); measure(pend.d, d2, mt - pend.t, pend.t, pend.th, pend.ppl); pend = null; }
+        else if (mt >= next && mt < t1) { pend = { d: grab(), t: mt }; pend.th = thumb(); pend.ppl = people(); while (next <= mt) next += step; }
       } catch (e) { return finish(e); }
       if (mt >= t1 - 0.03) finish();
     };
-    const onEnd = () => { if (pend) measure(pend.d, pend.d, 0, pend.t, pend.th); pend = null; finish(); };
+    const onEnd = () => { if (pend) measure(pend.d, pend.d, 0, pend.t, pend.th, pend.ppl); pend = null; finish(); };
     v.addEventListener('ended', onEnd);
     if ('requestVideoFrameCallback' in v) {
       const cb = (now, md) => { handle(md.mediaTime); if (!done) v.requestVideoFrameCallback(cb); };
@@ -271,9 +281,9 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
     for (let t = from; t < t1; t += step) {
       if (signal?.aborted) throw new Error('Cancelled');
       try {
-        await seek(Math.min(t, t1 - 0.08)); const d1 = grab(); const th = thumb();
+        await seek(Math.min(t, t1 - 0.08)); const d1 = grab(); const th = thumb(); const ppl = people();
         await seek(Math.min(t + 0.07, t1 - 0.01)); const d2 = grab();
-        measure(d1, d2, 0.07, t, th); fails = 0;
+        measure(d1, d2, 0.07, t, th, ppl); fails = 0;
       } catch (e) { if (++fails >= 3) break; }
     }
   };
@@ -301,7 +311,9 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
     s.speed = Math.hypot(s.vx, s.vy);
     s.shake = Math.max(Math.hypot(s.vx - mx, s.vy - my), s.speed * 0.5) * dtNom;
   }
-  return { samples: out, step, mode };
+  assignTargets(out);
+  for (const s of out) { const f = framingScore(s); if (f != null) s.fq = f; }
+  return { samples: out, step, mode, pose: !!pose };
 }
 
 const STRICT = {
@@ -312,6 +324,9 @@ const STRICT = {
 
 /** Flag bad samples. lapRef = reference sharpness (median of sharp-ish samples across ALL clips). */
 function flagSamples(samples, lapRef, P, rescue = false) {
+  // people detected in this clip at all? then a stretch (>= 1.5 s) with nobody in frame is a bad shot
+  const withPpl = samples.filter(s => s.ppl).length, anyone = samples.filter(s => s.ppl?.length).length;
+  const pplOn = FRAMING && withPpl >= samples.length * 0.5 && anyone >= withPpl * 0.4;
   for (const s of samples) {
     const r = []; s.soft = false;
     if (s.lap < Math.max(P.blurAbs, lapRef * P.blur) && !(s.luma < (rescue ? P.dark * 1.6 : P.dark))) r.push('blurry'); // dim frames read soft
@@ -321,6 +336,16 @@ function flagSamples(samples, lapRef, P, rescue = false) {
     if (s.luma > P.blown || s.bright > 0.55) r.push('blown out');
     if (s.shake > P.shake) r.push('shaky');
     s.bad = r;
+  }
+  if (pplOn) {
+    let i = 0;
+    while (i < samples.length) {
+      if (samples[i].ppl && !samples[i].ppl.length) {
+        let j = i; while (j + 1 < samples.length && samples[j + 1].ppl && !samples[j + 1].ppl.length) j++;
+        if (samples[j].t - samples[i].t >= 1.4) for (let k = i; k <= j; k++) samples[k].bad.push('nobody in frame');
+        i = j + 1;
+      } else i++;
+    }
   }
   // a moderately shaky sample between two shaky ones is part of the same shaky stretch
   samples.forEach((s, i) => {
@@ -339,7 +364,14 @@ function flagSamples(samples, lapRef, P, rescue = false) {
     } else i++;
   }
 }
+// "Keep her in frame": when people were detected, shots that show her well score higher (and multi-cam prefers them)
+let FRAMING = true;
+export const setFraming = (v) => { FRAMING = !!v; };
 export function quality(s, lapRef) {
+  const q = qualityBase(s, lapRef);
+  return FRAMING && s.fq != null ? +(q * 0.8 + s.fq * 0.25).toFixed(3) : q;
+}
+function qualityBase(s, lapRef) {
   const sharp = clamp(s.lap / Math.max(1, lapRef), 0, 1.5);
   const expo = 1 - clamp(Math.abs(s.luma - 0.47) / 0.47, 0, 1);
   const steady = 1 - clamp(s.shake / 0.07, 0, 1);
@@ -551,6 +583,7 @@ export function planCamera(shots, level, opts = {}) {
     if (fishK > 0 && type !== 'wide' && !prevFish && (s.wantFish || (ang === 'low' && nLow++ % 2 === 0) || (!ang && (type === 'close' || type === 'punch') && n % 5 === 3))) look.fish = fishK;
     prevFish = !!look.fish;
     s.cam = camFor(type, subj, L, flip, look);
+    if (opts.fit && s.cam) s.cam = opts.fit(s, s.cam);
     delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType;
     n++;
   }

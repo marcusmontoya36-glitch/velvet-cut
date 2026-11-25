@@ -1504,7 +1504,9 @@ function openSettings() {
   };
   modal('Settings', body, [{ label: 'Cancel' }, {
     label: 'Save', cls: 'primary', onClick: () => {
-      saveAI({ provider: $('#sProv').value, customUrl: $('#sUrl').value.trim(), customToken: $('#sTok').value.trim(), fal: $('#sFal').value.trim(), replicate: $('#sRep').value.trim(), runway: $('#sRun').value.trim() });
+      let prov = $('#sProv').value;
+      if (prov === 'none') { if ($('#sFal').value.trim()) prov = 'fal'; else if ($('#sUrl').value.trim()) prov = 'custom'; else if ($('#sRep').value.trim()) prov = 'replicate'; else if ($('#sRun').value.trim()) prov = 'runway'; }
+      saveAI({ provider: prov, customUrl: $('#sUrl').value.trim(), customToken: $('#sTok').value.trim(), fal: $('#sFal').value.trim(), replicate: $('#sRep').value.trim(), runway: $('#sRun').value.trim() });
       localStorage.setItem('vc.blurOnHide', $('#sBlur').checked ? '1' : '0');
       toast('Settings saved on this device');
     }

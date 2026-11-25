@@ -17,6 +17,7 @@ export const HOOKS = {
 };
 
 export function providerReady(cfg) {
+  if (cfg.provider === 'none' && cfg.fal) cfg.provider = 'fal';
   switch (cfg.provider) {
     case 'custom': return !!cfg.customUrl;
     case 'fal': return !!cfg.fal;

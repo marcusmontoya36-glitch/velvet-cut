@@ -47,8 +47,70 @@ export function detectPeople(pl, img) {
     }
     const box = [x0 - pw, y0 - ph * 2, x1 + pw, y1 + ph].map(v => clamp(v, 0, 1));
     if (face) { box[0] = Math.min(box[0], face[0]); box[1] = Math.min(box[1], face[1]); box[2] = Math.max(box[2], face[2]); box[3] = Math.max(box[3], face[3]); }
-    return { box: box.map(v => +v.toFixed(3)), face: face && face.map(v => +v.toFixed(3)), score: +(vis.length / lm.length).toFixed(2) };
+    // upper body (landmarks 0-12: face + shoulders, extended to mid-chest) and lower body (23-26: hips + knees)
+    const V = (i) => { const p = lm[i]; return p && (p.visibility ?? 1) > 0.3 && p.x > -0.2 && p.x < 1.2 && p.y > -0.2 && p.y < 1.2 ? p : null; };
+    const bb = (idx) => { const q = idx.map(V).filter(Boolean); if (q.length < 2) return null; let a = 1, b = 1, c = 0, d = 0; for (const p of q) { a = Math.min(a, p.x); b = Math.min(b, p.y); c = Math.max(c, p.x); d = Math.max(d, p.y); } return [a, b, c, d]; };
+    const hipY = [V(23), V(24)].filter(Boolean).map(p => p.y), shY = [V(11), V(12)].filter(Boolean).map(p => p.y);
+    let up = bb([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    if (up) {
+      const w = up[2] - up[0], shy = shY.length ? Math.max(...shY) : up[3], hy = hipY.length ? Math.min(...hipY) : null;
+      up = [up[0] - Math.max(0.025, w * 0.2), face ? Math.min(face[1], up[1]) : up[1] - 0.05, up[2] + Math.max(0.025, w * 0.2), hy != null ? shy + (hy - shy) * 0.45 : shy + 0.08];
+    }
+    let lo = bb([23, 24, 25, 26]);
+    if (lo) {
+      const w = lo[2] - lo[0], hy = Math.min(...(hipY.length ? hipY : [lo[1]])), knees = [V(25), V(26)].some(Boolean);
+      lo = [lo[0] - Math.max(0.04, w * 0.35), hy - 0.05, lo[2] + Math.max(0.04, w * 0.35), knees ? lo[3] + 0.05 : hy + 0.22];
+    }
+    const r3 = (b) => b && b.map(v => +clamp(v, 0, 1).toFixed(3));
+    return { box: box.map(v => +v.toFixed(3)), face: face && face.map(v => +v.toFixed(3)), up: r3(up), lo: r3(lo), full: !!(face && hipY.length), kn: !!(lo && [V(25), V(26)].some(Boolean)), an: [V(27), V(28)].some(Boolean), score: +(vis.length / lm.length).toFixed(2) };
   }).filter(Boolean);
+}
+
+/** detectPeople, plus a second look at the left / right part of the frame when only one person was found
+ * (the detector often returns one box for two overlapping bodies, e.g. kneeling in front of a standing person) */
+let cropCv = null;
+function addSigs(a, cv) {
+  // appearance signature per person: mean colour of the upper and the lower half of the body box
+  try {
+    const W = cv.width, H = cv.height, d = cv.getContext('2d').getImageData(0, 0, W, H).data;
+    for (const p of a) {
+      const b = p.box, sig = [];
+      for (const [y0, y1] of [[b[1], (b[1] + b[3]) / 2], [(b[1] + b[3]) / 2, b[3]]]) {
+        let r = 0, g = 0, bl = 0, n = 0;
+        const xa = Math.floor((b[0] + (b[2] - b[0]) * 0.25) * W), xb = Math.ceil((b[2] - (b[2] - b[0]) * 0.25) * W);
+        for (let y = Math.floor(y0 * H); y < Math.min(H, Math.ceil(y1 * H)); y += 2) for (let x = Math.max(0, xa); x < Math.min(W, xb); x += 2) { const k = (y * W + x) * 4; r += d[k]; g += d[k + 1]; bl += d[k + 2]; n++; }
+        sig.push(n ? +(r / n / 255).toFixed(3) : 0, n ? +(g / n / 255).toFixed(3) : 0, n ? +(bl / n / 255).toFixed(3) : 0);
+      }
+      p.sig = sig;
+    }
+  } catch { /* tainted / no canvas */ }
+  return a;
+}
+export function detectPeopleMulti(pl, cv) {
+  const a = detectPeople(pl, cv); if (!a) return a;
+  if (a.length !== 1 || typeof document === 'undefined') return addSigs(a, cv);
+  const A = a[0].box, cx = (A[0] + A[2]) / 2, W = cv.width, H = cv.height;
+  cropCv ||= document.createElement('canvas');
+  // left part, right part, then the lower 60 % (kneeling / bent-over / lying bodies)
+  for (const [x0, x1, y0] of [[0, Math.min(1, cx + 0.05), 0], [Math.max(0, cx - 0.05), 1, 0], [0, 1, 0.4]]) {
+    if (x1 - x0 < 0.25) continue;
+    const sw = Math.round((x1 - x0) * W), sh = Math.round((1 - y0) * H); cropCv.width = sw; cropCv.height = sh;
+    cropCv.getContext('2d').drawImage(cv, x0 * W, y0 * H, sw, sh, 0, 0, sw, sh);
+    const r = detectPeople(pl, cropCv) || [];
+    const mapB = (b) => b && [x0 + b[0] * (x1 - x0), y0 + b[1] * (1 - y0), x0 + b[2] * (x1 - x0), y0 + b[3] * (1 - y0)].map(v => +v.toFixed(3));
+    for (const p of r) {
+      const q = { ...p, box: mapB(p.box), face: mapB(p.face), up: mapB(p.up), lo: mapB(p.lo), second: true };
+      const i = area(inter(q.box, A)) / Math.max(1e-6, Math.min(area(q.box), area(A)));
+      const fd = q.face && a[0].face ? Math.hypot((q.face[0] + q.face[2] - a[0].face[0] - a[0].face[2]) / 2, (q.face[1] + q.face[3] - a[0].face[1] - a[0].face[3]) / 2) : 1;
+      // a plausible body: the face small next to the body and (unless lying down) in its top part
+      const B = q.box, bw = B[2] - B[0], bh = B[3] - B[1], F = q.face;
+      const fw0 = a[0].face ? a[0].face[2] - a[0].face[0] : 0; // two people in one shot have faces of a similar size
+      const ok = (!F || !fw0 || (F[2] - F[0]) >= 0.6 * fw0) && (!F || (area(F) <= 0.2 * area(B) && (F[3] - F[1]) <= 0.45 * bh && (bw > bh || (F[1] - B[1]) <= 0.45 * bh)));
+      const fin = F && inside({ x: (F[0] + F[2]) / 2, y: (F[1] + F[3]) / 2 }, A); // its face on the first body = a guess on her torso
+      if (ok && fd > 0.06 && i < (fin ? 0.5 : 0.7) && area(q.box) > 0.01) { a.push(q); return addSigs(a, cv); }
+    }
+  }
+  return addSigs(a, cv);
 }
 
 // ---------------- action area (motion + skin), from the analysis frame ----------------
@@ -113,23 +175,72 @@ export function assignTargets(samples, focusAt = () => null) {
   const dens = (s, b) => (s.mg ? gridMotion(s.mg, b) : s.mb ? area(inter(b, s.mb)) * 0.05 : 0) / Math.max(1e-4, area(b));
   const tracks = [], ids = new Map();
   for (const s of samples) {
-    const ppl = s.ppl || [], used = new Set(), mine = [];
-    for (const p of ppl) {
-      let best = null, bd = 1e9;
-      for (const tr of tracks) {
-        if (used.has(tr) || s.t - tr.lt > 3) continue;
-        const [ax, ay] = ctr(tr.last), [bx, by] = ctr(p.box), d = Math.hypot(ax - bx, ay - by) - 0.4 * iou(tr.last, p.box);
-        if (d < bd) { bd = d; best = tr; }
-      }
-      if (!best || bd > 0.3) { best = { id: tracks.length, her: 0, not: 0, last: p.box, lt: s.t }; tracks.push(best); }
-      used.add(best); best.last = p.box; best.lt = s.t; mine.push(best);
+    const ppl = s.ppl || [], mine = new Array(ppl.length).fill(null);
+    // link people to tracks by the globally best pairs (a small person inside a big one's old box must not steal his track)
+    const pairs = [];
+    ppl.forEach((p, i) => tracks.forEach(tr => { if (s.t - tr.lt > 3) return; const [ax, ay] = ctr(tr.last), [bx, by] = ctr(p.box); const d = Math.hypot(ax - bx, ay - by) + 0.5 * (1 - iou(tr.last, p.box)); if (d < 0.65) pairs.push({ i, tr, d }); }));
+    pairs.sort((a, b) => a.d - b.d);
+    const usedT = new Set();
+    for (const { i, tr } of pairs) if (!mine[i] && !usedT.has(tr)) { mine[i] = tr; usedT.add(tr); }
+    ppl.forEach((p, i) => {
+      if (!mine[i]) { mine[i] = { id: tracks.length, her: 0, not: 0, last: p.box, lt: s.t }; tracks.push(mine[i]); }
+      const best = mine[i]; best.last = p.box; best.lt = s.t;
       const f = focusAt(s.t); if (f && inside(f, p.box)) best.her += 50;
-    }
+    });
     if (ppl.length >= 2) {
       const d = ppl.map(p => dens(s, p.box)), mx = Math.max(...d), k = d.indexOf(mx), second = Math.max(...d.filter((_, i) => i !== k));
       if (mx > 1e-4 && mx >= second * 1.25) mine.forEach((tr, i) => { if (i === k) tr.her++; else tr.not++; });
     }
     ids.set(s, mine);
+  }
+  // appearance identities: when two people were seen together, split all detections into 2 by colour signature
+  const dets = []; for (const s of samples) for (const p of s.ppl || []) if (p.sig) dets.push({ s, p });
+  const pair = samples.find(s => s.ppl?.length >= 2 && s.ppl[0].sig && s.ppl[1].sig);
+  let cl = null;
+  if (pair && dets.length >= 4) {
+    const dist = (a, b) => a.reduce((t, v, i) => t + (v - b[i]) ** 2, 0);
+    let C = [pair.ppl[0].sig.slice(), pair.ppl[1].sig.slice()];
+    if (dist(C[0], C[1]) > 0.003) {
+      cl = new Map();
+      for (let it = 0; it < 8; it++) {
+        for (const s of samples) {
+          const ps = (s.ppl || []).filter(p => p.sig); if (!ps.length) continue;
+          if (ps.length >= 2) { // two people in one frame are two different identities
+            const a = dist(ps[0].sig, C[0]) + dist(ps[1].sig, C[1]), b = dist(ps[0].sig, C[1]) + dist(ps[1].sig, C[0]);
+            cl.set(ps[0], a <= b ? 0 : 1); cl.set(ps[1], a <= b ? 1 : 0); for (const p of ps.slice(2)) cl.set(p, dist(p.sig, C[0]) <= dist(p.sig, C[1]) ? 0 : 1);
+          } else cl.set(ps[0], dist(ps[0].sig, C[0]) <= dist(ps[0].sig, C[1]) ? 0 : 1);
+        }
+        C = [0, 1].map(k => { const m = dets.filter(x => cl.get(x.p) === k); return m.length ? m[0].p.sig.map((_, i) => m.reduce((t, x) => t + x.p.sig[i], 0) / m.length) : C[k]; });
+      }
+    }
+  }
+  if (cl) {
+    // which identity is her: Set focus, else who moves more (motion per body area, overlap with the other removed)
+    const vote = [0, 0];
+    const exd = (s, b, o) => { const ov = o ? inter(b, o) : null, ao = ov && area(ov) > 0 ? area(ov) : 0; const m = (s.mg ? gridMotion(s.mg, b) - (ao ? gridMotion(s.mg, ov) : 0) : 0); return m / Math.max(1e-4, area(b) - ao); };
+    for (const s of samples) {
+      const ps = (s.ppl || []).filter(p => cl.has(p));
+      const f = focusAt(s.t); for (const p of ps) if (f && inside(f, p.box)) vote[cl.get(p)] += 50;
+      const a = ps.find(p => cl.get(p) === 0), b = ps.find(p => cl.get(p) === 1);
+      if (a && b) { const da = exd(s, a.box, b.box), db = exd(s, b.box, a.box); if (Math.max(da, db) > 1e-4 && Math.max(da, db) >= Math.min(da, db) * 1.15) vote[da > db ? 0 : 1]++; }
+    }
+    const herK = vote[0] === vote[1] ? null : vote[0] > vote[1] ? 0 : 1;
+    if (herK != null) {
+      for (const s of samples) {
+        const ps = (s.ppl || []);
+        const her = ps.find(p => cl.get(p) === herK), him = ps.find(p => cl.has(p) && cl.get(p) !== herK);
+        s._tg = her ? her.box : null; s._tgP = her || null; s._him = him || null;
+      }
+      // a lone detection that sits where he was in the neighbouring frames (and not where she was) is him
+      const iou = (a, b) => { const i = area(inter(a, b)); return i / Math.max(1e-6, area(a) + area(b) - i); };
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i]; if (!s._tg || s._him || (s.ppl || []).length !== 1) continue;
+        const nb = [samples[i - 1], samples[i + 1]].filter(Boolean);
+        const likeHim = nb.some(n => n._him && iou(n._him.box, s._tg) > 0.6), likeHer = nb.some(n => n._tg && n._him && iou(n._tg, s._tg) > 0.5);
+        if (likeHim && !likeHer) { s._him = s.ppl[0]; s._tg = null; s._tgP = null; }
+      }
+      return;
+    }
   }
   for (const s of samples) {
     const mine = ids.get(s) || [], ppl = s.ppl || [];
@@ -144,8 +255,47 @@ export function assignTargets(samples, focusAt = () => null) {
         if (mx > 1e-4 && mx >= Math.max(...d.filter((_, i) => i !== j)) * 1.5) tg = ppl[j].box;
       }
     }
-    s._tg = tg;
+    s._tg = tg; s._tgP = tg ? ppl.find(p => p.box === tg) || null : null;
+    // him = the other person in view (nearest to her when there are several)
+    let him = null;
+    if (!tg) ppl.forEach((p, i) => { const tr = mine[i]; if (tr && tr.not > tr.her && (!him || area(p.box) > area(him.box))) him = p; });
+    if (tg) for (const p of ppl) { if (p.box === tg) continue; const d = (q) => Math.hypot((q.box[0] + q.box[2]) / 2 - (tg[0] + tg[2]) / 2, (q.box[1] + q.box[3]) / 2 - (tg[1] + tg[3]) / 2); if (!him || d(p) < d(him)) him = p; }
+    s._him = him;
   }
+}
+/**
+ * POV vs third-person for one video, from the people data: third-person = two people with visible heads in a good
+ * share of frames; POV = one full person while the other shows up only as a headless partial body / hands at the
+ * frame edge (and handheld camera shake makes POV more likely). 'solo' = never a second person.
+ */
+export function classifyPov(samples) {
+  let withP = 0, two = 0, partial = 0, second = 0, bot = 0, botN = 0; const sh = [], vx = [], vy = [], fr2 = [];
+  for (const s of samples || []) {
+    if (s.gm != null) { vx.push(s.gm); vy.push(0); }
+    // movement along the bottom edge outside her body (his hips / hands entering the shot)
+    if (s.mg && s.ppl?.length === 1) {
+      const b = s.ppl[0].box; let m = 0, tot = 0;
+      for (let j = 0; j < 9; j++) for (let i = 0; i < 16; i++) { const v = s.mg[j * 16 + i]; tot += v; if (j >= 7 && ((i + 0.5) / 16 < b[0] - 0.02 || (i + 0.5) / 16 > b[2] + 0.02 || (j + 0.5) / 9 > b[3])) m += v; }
+      if (tot > 0.05) { bot += m / tot; botN++; }
+    }
+    const ppl = s.ppl; if (!ppl?.length) continue;
+    withP++;
+    const heads = ppl.filter(p => p.face).length;
+    if (ppl.length >= 2) second++;
+    if (ppl.length >= 2 && heads >= 2) { two++; fr2.push(ppl.filter(p => p.face).map(p => [(p.face[0] + p.face[2]) / 2, (p.face[1] + p.face[3]) / 2])); }
+    else if (ppl.some(p => !p.face && (p.box[3] > 0.96 || p.box[0] < 0.04 || p.box[2] > 0.96))) partial++;
+  }
+  // a real second person shows up again in about the same place; one-off phantom bodies (pose model guesses on
+  // his legs / the sheets in POV shots) do not
+  two = fr2.filter((fs, i) => fs.every(c => fr2.some((o, j) => j !== i && o.some(d => Math.hypot(c[0] - d[0], c[1] - d[1]) < 0.15)))).length;
+  const med = (a) => { const b = [...a].sort((x, y) => x - y); return b.length ? b[b.length >> 1] : 0; };
+  const mx = med(vx), my = med(vy), shake = vx.length ? med(vx.map((v, i) => Math.hypot(v - mx, vy[i] - my))) : 0; // handheld jitter (frame widths / s)
+  const f2 = withP ? two / withP : 0, fp = withP ? partial / withP : 0, fb = botN ? bot / botN : 0;
+  const handheld = shake >= 1; // median global shift between the two analysis frames >= 1 px (at 120 px wide)
+  const need = handheld ? 0.4 : 0.3;
+  // two heads seen often enough = third-person; otherwise POV (his head never shows) or one person only
+  const kind = withP < 3 ? 'unknown' : f2 >= need && f2 >= fp ? 'third' : (fp >= 0.1 || handheld || f2 > 0) ? 'pov' : 'solo';
+  return { kind, two: +f2.toFixed(2), partial: +fp.toFixed(2), bottom: +fb.toFixed(2), second: withP ? +(second / withP).toFixed(2) : 0, shake: +shake.toFixed(3) };
 }
 /**
  * protected box for one sample. focus = {x, y} (her, picked with Set focus) or null.
@@ -175,7 +325,7 @@ export function protectedOf(s, focus = null) {
   if (tgt) { /* from the track */ }
   else if (focus) tgt = ppl.find(p => inside(focus, p.box)) || ppl.reduce((a, p) => { const d = (q) => Math.hypot((q.box[0] + q.box[2]) / 2 - focus.x, (q.box[1] + q.box[3]) / 2 - focus.y); return !a || d(p) < d(a) ? p : a; }, null);
   else tgt = ppl.reduce((a, p) => { const sc = (q) => (mab ? area(inter(q.box, mab)) : ab ? area(inter(q.box, ab)) * 0.3 : 0) + area(q.box) * 0.1; return !a || sc(p) > sc(a) ? p : a; }, null);
-  let box = tgt.box;
+  let box = tgt.kn === false ? herPad(tgt) : tgt.box; // no knees found: her legs are below the box (cut off by the pose model)
   for (const o of ppl) {
     if (o === tgt) continue;
     const near = inter(grow(tgt.box, 0.12), grow(o.box, 0.12));
@@ -229,7 +379,7 @@ export function boxInside(cam, p, box, aspect, m = 0) {
  * Order of remedies: pan/tilt the crop, then a gentler zoom, then soften keystone / dutch / fisheye.
  * If her region is bigger than the frame allows with margin, the margin shrinks (never crops her).
  */
-export function fitCam(cam0, keys, { margin = 0.08, aspect = 16 / 9, zoomK = 1 } = {}) {
+export function fitCam(cam0, keys, { margin = 0.08, aspect = 16 / 9, zoomK = 1, warpFirst = false } = {}) {
   if (!cam0 || !keys.length) return cam0;
   const base = { ...cam0 };
   if (zoomK !== 1) { base.z0 = 1 + (base.z0 - 1) * zoomK; base.z1 = 1 + (base.z1 - 1) * zoomK; }
@@ -272,8 +422,10 @@ export function fitCam(cam0, keys, { margin = 0.08, aspect = 16 / 9, zoomK = 1 }
   };
   let best = null;
   const warped = base.ks || base.roll || base.fish;
+  // hide mode: the tight crop matters more than the look -> soften the warp before giving up zoom
+  if (warpFirst && warped) for (const ws of [1, 0.6, 0.3, 0]) { const c = variant(1, ws); if (panFit(c)) { best = c; break; } }
   // 2) a gentler zoom (largest zoom that keeps her in), 3) only then soften keystone / dutch tilt / fisheye
-  for (const ws of warped ? [1, 0.6, 0.3, 0] : [1]) {
+  if (!best) for (const ws of warped ? [1, 0.6, 0.3, 0] : [1]) {
     let c = variant(1, ws);
     if (panFit(c)) { best = c; break; }
     c = variant(0, ws);
@@ -324,3 +476,131 @@ export function shotKeys(samples, a, b, focusAt = () => null, speed = 1) {
   return keys;
 }
 export { union as boxUnion };
+
+// ---------------- "Hide his upper body" (third-person shots) ----------------
+const topPart = (b, f) => [b[0], b[1], b[2], b[1] + (b[3] - b[1]) * f];
+/** what of him must NOT show: tight = head + shoulders + upper torso, ctx (context shot) = head only */
+function exclOf(him, ctx) {
+  if (ctx) return him.face ? grow(him.face, 0.35) : topPart(him.box, 0.16);
+  return him.up || topPart(him.box, 0.4);
+}
+/**
+ * per-shot keys for hide mode: box = her full body + his hips/thighs (and where they touch) [+ the movement at her],
+ * ex = his head/shoulders/upper torso (context shots: only his head). Same smoothing as shotKeys.
+ */
+// her pose box grown for the tight hide crops: pose boxes stop at the last visible joint, so folded / kneeling
+// legs (no knees found) get a lot of extra room below, and hair / hands a little all round
+function herPad(p) {
+  if (!p) return null; const b = p.box || p, w = b[2] - b[0], h = b[3] - b[1];
+  const down = p.kn === false ? Math.max(0.2, 0.9 * h) : p.an === false ? (h < 1.6 * w ? Math.max(0.25, 0.6 * h) : 0.15 * h) : 0.1 * h, side = Math.max(0.03, 0.25 * w);
+  return [Math.max(0, b[0] - side), Math.max(0, b[1] - 0.12 * h), Math.min(1, b[2] + side), Math.min(1, b[3] + down)];
+}
+export function hideKeys(samples, a, b, focusAt = () => null, ctx = false) {
+  const ss = (samples || []).filter(s => s.t >= a - 0.6 && s.t <= b + 0.6);
+  if (!ss.length) return [];
+  assignTargets(samples, focusAt);
+  const pb = ss.map(s => {
+    const her = s._tg, him = s._him;
+    if (!her && him) { // only he was detected here: she is where she was just before / after (grown), plus any movement below his chest
+      const ex = exclOf(him, ctx), lo = him.lo || [him.box[0], him.box[1] + (him.box[3] - him.box[1]) * 0.45, him.box[2], him.box[3]];
+      let pv = null, nx = null;
+      for (const o of samples) { if (!o._tg || Math.abs(o.t - s.t) > 3) continue; if (o.t < s.t && (!pv || o.t > pv.t)) pv = o; if (o.t > s.t && (!nx || o.t < nx.t)) nx = o; }
+      if (!pv && !nx) return { t: s.t, box: protectedOf(s, focusAt(s.t)).box, ex }; // no idea where she is: keep everyone
+      let box = grow(union(herPad(pv && (pv._tgP || pv._tg)), herPad(nx && (nx._tgP || nx._tg))), 0.1);
+      if (!pv || !nx) { const g = Math.min(0.15, 0.1 * Math.abs(s.t - (pv || nx).t)); box = [box[0] - g, box[1] - g, box[2] + g, box[3] + g].map(v => clamp(v, 0, 1)); } // she may have moved on since
+      box = union(box, lo);
+      box = union(box, [Math.max(0, him.box[0] - 0.03), ex[3], Math.min(1, him.box[2] + 0.03), him.box[3]]); // she is likely in front of him (that is why she was missed)
+      if (s.mb) { const below = inter(grow(s.mb, 0.05), [0, ex[3], 1, 1]); if (area(below) > 0) box = union(box, below); }
+      return { t: s.t, box, ex };
+    }
+    if (!her) return { t: s.t, box: protectedOf(s, focusAt(s.t)).box, ex: null }; // not sure who she is: keep everyone
+    let box = herPad(s._tgP || her), ex = null;
+    if (him) {
+      ex = exclOf(him, ctx);
+      const lo = ctx ? [him.box[0], ex[3], him.box[2], him.box[3]] : (him.lo || [him.box[0], him.box[1] + (him.box[3] - him.box[1]) * 0.45, him.box[2], him.box[1] + (him.box[3] - him.box[1]) * 0.8]);
+      if (area(inter(grow(lo, 0.25), grow(her, 0.25))) > 0) {
+        box = union(box, lo);
+        const ct = inter(grow(her, 0.12), grow(lo, 0.12)); if (area(ct) > 0) box = union(box, ct);
+      }
+    }
+    if (s.mb) { const nm = inter(s.mb, grow(her, 0.15)); if (area(nm) > 0) box = union(box, nm); }
+    return { t: s.t, box, ex };
+  });
+  // a one-off jump of her box up into his upper body is the pose model merging the two of them: trim it back
+  const tops = pb.filter(x => x.ex).map(x => x.box[1]).sort((u, v) => u - v);
+  if (tops.length >= 3) {
+    const mt = tops[tops.length >> 1];
+    for (const x of pb) if (x.ex && x.box[1] < mt - 0.12 && x.box[1] < x.ex[3] && x.box[1] >= x.ex[1] - 0.1) x.box = [x.box[0], mt - 0.06, x.box[2], x.box[3]];
+  }
+  const keys = [];
+  for (let i = 0; i <= 10; i++) {
+    const t = a + (b - a) * i / 10;
+    let prev = null, next = null;
+    for (const x of pb) { if (x.t <= t && (!prev || x.t > prev.t)) prev = x; if (x.t >= t && (!next || x.t < next.t)) next = x; }
+    const use = pb.filter(x => Math.abs(x.t - t) <= 0.4 || x === prev || x === next);
+    let kb = use.reduce((u, x) => union(u, x.box), null);
+    // past the first / last analysis frame she may have moved on: allow for it (about 0.1 of the frame per second)
+    if (kb) { // between two analysis frames she can wander off the straight line too (about 0.03 of the frame per second)
+      const g = (!prev || !next) ? Math.min(0.15, 0.1 * Math.abs(t - (prev || next).t)) : Math.min(0.06, 0.03 * (next.t - prev.t));
+      if (g > 0.01) kb = [kb[0] - g, kb[1] - g, kb[2] + g, kb[3] + g].map(v => clamp(v, 0, 1));
+    }
+    keys.push({ p: i / 10, box: kb, ex: use.reduce((u, x) => (x.ex ? union(u, x.ex) : u), null) });
+  }
+  return keys;
+}
+/**
+ * Tightest crop (frame aspect) that holds box with margin, slid inside its slack to show as little of ex as possible.
+ * Returns { z, cx, cy } in source units.
+ */
+function tightCrop(P, E, margin, zMax) {
+  const m = clamp(Math.min(margin, (1 - (P[2] - P[0])) / 2 - 0.002, (1 - (P[3] - P[1])) / 2 - 0.002, P[0], P[1], 1 - P[2], 1 - P[3]), 0, margin);
+  const sz = clamp(Math.max(P[2] - P[0] + 2 * m, P[3] - P[1] + 2 * m, 1 / zMax), 0, 1);
+  const lx = Math.max(0, P[2] + m - sz), hx = Math.min(1 - sz, P[0] - m), ly = Math.max(0, P[3] + m - sz), hy = Math.min(1 - sz, P[1] - m);
+  const pcx = (P[0] + P[2]) / 2, pcy = (P[1] + P[3]) / 2;
+  let best = null;
+  for (let i = 0; i <= 16; i++) for (let j = 0; j <= 16; j++) {
+    const l = hx >= lx ? lx + (hx - lx) * i / 16 : clamp(pcx - sz / 2, 0, 1 - sz), t = hy >= ly ? ly + (hy - ly) * j / 16 : clamp(pcy - sz / 2, 0, 1 - sz);
+    const vis = E ? area(inter(E, [l, t, l + sz, t + sz])) : 0;
+    const sc = vis * 100 + Math.hypot(l + sz / 2 - pcx, t + sz / 2 - pcy) * 0.01;
+    if (!best || sc < best.sc) best = { sc, l, t };
+  }
+  return { z: 1 / sz, cx: best.l + sz / 2, cy: best.t + sz / 2 };
+}
+/** hide-mode camera: tight crops on her (+ his lower body) away from his upper body, then the same safety fit as v11 */
+export function fitHide(cam0, keys, { margin = 0.08, aspect = 16 / 9, zMax = 2.5, ctx = false } = {}) {
+  if (!cam0 || !keys.length) return cam0;
+  margin *= 0.5; // her box is already padded for the hide crops (missing legs / hair / movement between frames)
+  const U = (ks, f) => ks.reduce((u, k) => (k[f] ? union(u, k[f]) : u), null);
+  const A = keys.filter(k => k.p <= 0.5), B = keys.filter(k => k.p >= 0.5);
+  const c0 = tightCrop(U(A, 'box'), U(A, 'ex'), margin, zMax), c1 = tightCrop(U(B, 'box'), U(B, 'ex'), margin, zMax);
+  const cam = { ...cam0, z0: c0.z, x0: c0.cx, y0: c0.cy, z1: c1.z, x1: c1.cx, y1: c1.cy };
+  // keep a little of the planned move's character (push in / pull back) when there is room
+  if (cam0.type === 'push' || cam0.type === 'punch' || cam0.type === 'close') cam.z1 = Math.min(zMax, cam.z1 * 1.05);
+  if (cam0.type === 'pull') cam.z0 = Math.min(zMax, cam.z0 * 1.05);
+  const out = fitCam(cam, keys, { margin, aspect, zoomK: 1, warpFirst: true });
+  // never zoom past what holds her whole box (each half of the move)
+  for (const [z, ks] of [['z0', A], ['z1', B]]) { const q = U(ks, 'box'); if (q) { const big = Math.max(q[2] - q[0], q[3] - q[1], 1e-3); out[z] = big >= 0.9 ? 1 : +Math.max(1, Math.min(out[z], 1 / big)).toFixed(3); } if (out[z] < 1.1) out[z] = 1; } // under 1.1x hides nothing, only risks her edges
+  // she reaches a frame edge (feet at the bottom, ...): make the crop touch that edge exactly
+  const P = U(keys, 'box');
+  if (P) for (const [x, y] of [['x0', 'y0'], ['x1', 'y1']]) {
+    // camAt clamps the centre into the frame, so 1 / 0 = flush with that edge all through the move
+    const h = 0.49 / Math.max(1, out[y === 'y0' ? 'z0' : 'z1']); // just reach that edge (camAt clamps the overshoot)
+    if (P[3] >= 0.985) out[y] = Math.max(out[y], 1 - h); else if (P[1] <= 0.015) out[y] = Math.min(out[y], h);
+    if (P[2] >= 0.985) out[x] = Math.max(out[x], 1 - h); else if (P[0] <= 0.015) out[x] = Math.min(out[x], h);
+  }
+  // last check over the whole move (the eased zoom / pan between the two ends): every key's box must show
+  const okAll = (c) => keys.every(k => !k.box || boxInside(c, k.p, k.box, aspect, 0));
+  if (!okAll(out)) {
+    const zm = Math.min(out.z0, out.z1), c2 = { ...out, z0: zm, z1: zm };
+    if (okAll(c2)) Object.assign(out, c2);
+    else { Object.assign(out, { z0: 1, z1: 1, x0: 0.5, y0: 0.5, x1: 0.5, y1: 0.5, fitted: 'full' }); delete out.ks; delete out.angle; delete out.roll; delete out.fish; }
+  }
+  out.hide = ctx ? 'ctx' : 'tight';
+  return out;
+}
+/** how much of a box shows in the output of cam at p (0..1, sampled) */
+export function visibleFrac(cam, p, b, aspect = 16 / 9) {
+  let k = 0, t = 0;
+  for (let i = 0; i <= 8; i++) for (let j = 0; j <= 8; j++) { const x = b[0] + (b[2] - b[0]) * i / 8, y = b[1] + (b[3] - b[1]) * j / 8; t++; if (boxInside(cam, p, [x, y, x, y], aspect, 0)) k++; }
+  return k / t;
+}

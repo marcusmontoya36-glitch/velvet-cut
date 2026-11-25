@@ -3,7 +3,7 @@
 // Everything runs in the browser by seeking a hidden <video> and reading small canvas frames,
 // so memory stays flat no matter how long the clip is (it never loads the whole file).
 
-import { actionBox, detectPeople, framingScore, assignTargets } from './framing.js';
+import { actionBox, detectPeople, detectPeopleMulti, framingScore, assignTargets } from './framing.js';
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const r2 = (x) => Math.round(x * 100) / 100;
 const median = (a) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
@@ -18,6 +18,7 @@ export const AUTO_DEFAULTS = {
   camera: true, camLevel: 2, altAngle: false, // camLevel 1 subtle, 2 medium, 3 bold
   angles: true,          // simulated high (from above) / low (from below) angles mixed into the rotation
   dutch: true,           // slight dutch tilt on some of the angled shots
+  hideMan: 'most',       // third-person clips: hide his upper body on 'most' | 'all' shots | 'off'
   keepFrame: true,       // "Keep her in frame": every camera move keeps her + the action inside the crop
   frameTight: 'balanced', // loose | balanced | tight (margin around her)
   fish: '0.18',          // fisheye lens on some close / low shots: '0' off | '0.18' subtle | '0.32' strong
@@ -209,7 +210,7 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
   // people (pose model) on a 256-px copy of the same frame; null = model not available
   const PW = 256, PH = Math.round(PW * AH / AW);
   const pcv = pose ? document.createElement('canvas') : null; if (pcv) { pcv.width = PW; pcv.height = PH; }
-  const people = () => { if (!pose) return null; try { pcv.getContext('2d').drawImage(v, 0, 0, PW, PH); return detectPeople(pose, pcv); } catch { return null; } };
+  const people = () => { if (!pose) return null; try { pcv.getContext('2d').drawImage(v, 0, 0, PW, PH); return detectPeopleMulti(pose, pcv); } catch { return null; } };
   const thumb = () => { tctx.drawImage(cv, 0, 0, tc.width, tc.height); return tc.toDataURL('image/jpeg', 0.55); };
   const out = [];
   let prevG = null, prevSig = null, prevHist = null;
@@ -230,6 +231,7 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
     const cut = prevSig ? Math.min(1, sigDiff(prevSig, sig) * 4) * 0.5 + Math.min(1, histDiff(prevHist, hs) * 2.5) * 0.5 : 0;
     const subj = subject(d1, g1, g2, AW, AH, sh);
     const ab = actionBox(d1, g1, g2, AW, AH, sh);
+    subj.gm = Math.abs(sh.dx) + Math.abs(sh.dy);
     if (ab) { subj.ab = ab.box; subj.am = ab.mot; if (ab.mbox) subj.mb = ab.mbox; subj.mg = ab.mg; }
     if (ppl) subj.ppl = ppl;
     out.push({ t: r2(t), dt: okDt ? dt : null, luma, sd, sat, dark, bright, shad, lap: lapVar(g1, AW, AH),

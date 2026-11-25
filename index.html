@@ -122,6 +122,9 @@
         <label>Framing tightness<select id="auTight">
           <option value="loose">Loose — lots of room, gentle zooms</option><option value="balanced" selected>Balanced</option><option value="tight">Tight — closer, smaller margin</option>
         </select></label>
+        <label>🙈 Hide his upper body (third-person clips: zoom on her + his lower body, keep his face out)<select id="auHide">
+          <option value="most" selected>Most shots (an occasional wider shot, still without his face)</option><option value="all">All shots</option><option value="off">Off</option>
+        </select></label>
         <label class="chk"><input type="checkbox" id="auCam"> 🎥 Dynamic camera (zooms, punch-ins, pans, multi-angle feel)</label>
         <label>Camera intensity: <b id="auCamV">Medium</b><input id="auCamL" type="range" min="1" max="3" step="1" value="2"></label>
         <label class="chk"><input type="checkbox" id="auAlt"> Alt angles (occasional mirrored shots)</label>
@@ -183,6 +186,7 @@
           <button id="ciDup">⧉ Duplicate</button>
         </div>
         <div class="grid2">
+          <label>Point of view<select id="ciPov"><option value="auto" id="ciPovAuto">Auto</option><option value="pov">POV (keep framing)</option><option value="third">Third-person (hide his upper body)</option></select></label>
           <label>Framing<select id="ciCam">
             <option value="none">Full frame (no camera move)</option><option value="wide">Wide (slow creep)</option><option value="medium">Medium</option>
             <option value="close">Close-up</option><option value="punch">Punch-in (tight)</option><option value="push">Push in</option>

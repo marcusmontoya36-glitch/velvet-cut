@@ -5,7 +5,7 @@ import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
 import { canRemux, remuxExport, wcBlocker, createWcExport } from './wcexport.js';
 import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue, lookOf, extendShots, editLength, setFraming } from './autoedit.js';
-import { loadPose, poseStatus, fitCam, shotKeys, protectedOf, boxUnion, TIGHTNESS } from './framing.js';
+import { loadPose, poseStatus, fitCam, shotKeys, protectedOf, boxUnion, TIGHTNESS, classifyPov, hideKeys, fitHide } from './framing.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
 import { loadAI, saveAI, HOOKS, providerReady, runHook } from './hooks.js';
 
@@ -572,6 +572,8 @@ function renderClipInspector() {
   if (document.activeElement !== $('#ciIn')) $('#ciIn').value = c.in;
   if (document.activeElement !== $('#ciOut')) $('#ciOut').value = c.out;
   $('#ciIn').max = c.dur; $('#ciOut').max = c.dur;
+  { const k = S.analysis.get(c.mediaId)?.pov?.kind; $('#ciPov').value = S.proj.pov?.[c.mediaId] || 'auto';
+    $('#ciPovAuto').textContent = `Auto (${k === 'third' ? 'third-person' : k === 'pov' ? 'POV' : k === 'solo' ? 'one person' : 'not analysed'})`; }
   $('#ciCam').value = c.cam?.type || 'none'; $('#ciFlip').checked = !!c.cam?.flip; $('#ciFlip').disabled = !c.cam;
   $('#ciAngle').value = c.cam?.angle || 'none'; $('#ciAngle').disabled = !c.cam;
   $('#ciLens').value = c.cam?.roll && c.cam?.fish ? 'both' : c.cam?.roll ? 'dutch' : c.cam?.fish ? 'fish' : 'none'; $('#ciLens').disabled = !c.cam;
@@ -893,7 +895,29 @@ function subjectFromProtected(c, a, b) {
   const [cx, cy] = ctr(A), [cx1, cy1] = ctr(B);
   return { cx, cy, cx1, cy1, conf: 0.8 };
 }
+// ---- "Hide his upper body" on third-person clips ----
+function povOf(mediaId) { const o = S.proj.pov?.[mediaId]; const k = S.analysis.get(mediaId)?.pov?.kind; return o || k || 'unknown'; }
+const isThird = (mediaId) => povOf(mediaId) === 'third';
+// which shots hide him: 'most' = 4 of every 5 third-person shots (the 5th is a wider context shot that still hides his face)
+function hider(st) {
+  let k = 0;
+  return (s) => {
+    delete s.hide;
+    if (st.hideMan === 'off' || !isThird(s.mediaId)) return;
+    s.hide = st.hideMan === 'all' || k % 5 !== 2 ? 'tight' : 'ctx'; k++;
+  };
+}
+function assignHide(shots, st) { const h = hider(st); shots.forEach(h); }
 function fitFor(c, cam, st = loadAutoSettings()) {
+  if (cam && c.hide && st.hideMan !== 'off' && isThird(c.mediaId)) {
+    const sm = S.analysis.get(c.mediaId)?.samples;
+    if (sm?.length) {
+      const { f, aspect } = frameMap(c.mediaId), ctx = c.hide === 'ctx';
+      const keys = hideKeys(sm, c.in, c.out, focusAtFor(c), ctx).map(k => ({ p: k.p, box: f(k.box), ex: f(k.ex) }));
+      const T = TIGHTNESS[st.frameTight] || TIGHTNESS.balanced;
+      if (keys.length) return fitHide(cam, keys, { margin: T.margin, aspect, ctx, zMax: st.frameTight === 'loose' ? 2 : 2.5 });
+    }
+  }
   if (!cam || st.keepFrame === false) return cam;
   const keys = keysFor(c); if (!keys.length) return cam;
   const T = TIGHTNESS[st.frameTight] || TIGHTNESS.balanced;
@@ -911,7 +935,8 @@ function renderProtBox() {
   const sm = S.analysis.get(c.mediaId)?.samples; if (!sm?.length) return;
   const t = player.currentTime, fa = focusAtFor(c);
   const near = sm.filter(x => Math.abs(x.t - t) <= 0.4); if (!near.length) return;
-  const box = near.reduce((u, x) => boxUnion(u, protectedOf(x, fa(x.t)).box), null); if (!box) return;
+  const hk = c.hide ? hideKeys(sm, Math.max(c.in, t - 0.4), Math.min(c.out, t + 0.4), fa, c.hide === 'ctx')[5] : null;
+  const box = hk?.box || near.reduce((u, x) => boxUnion(u, protectedOf(x, fa(x.t)).box), null); if (!box) return;
   const pts = [];
   for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push([box[0] + (box[2] - box[0]) * u, box[1]]); }
   for (let i = 0; i <= 12; i++) { const u = i / 12; pts.push([box[2], box[1] + (box[3] - box[1]) * u]); }
@@ -922,6 +947,12 @@ function renderProtBox() {
   pts.forEach(([x, y], i) => { const [sx, sy] = contentToStage(x, y); if (sx < 0 || sx > 1 || sy < 0 || sy > 1) inside = false; i ? g.lineTo(sx * W, sy * H) : g.moveTo(sx * W, sy * H); });
   g.closePath(); g.lineWidth = 2; g.setLineDash([6, 4]); g.strokeStyle = inside ? '#3ee08f' : '#ff4d6d'; g.stroke();
   g.setLineDash([]); g.fillStyle = inside ? '#3ee08f' : '#ff4d6d'; g.font = '12px system-ui'; g.fillText(inside ? 'her + action ✓' : 'outside crop', 8, H - 10);
+  if (c.hide) { // his upper body (kept out of the shot when possible)
+    const ex = hk?.ex;
+    if (ex) { const q = [[ex[0], ex[1]], [ex[2], ex[1]], [ex[2], ex[3]], [ex[0], ex[3]]].map(([x, y]) => contentToStage(x, y));
+      g.beginPath(); q.forEach(([sx, sy], i) => i ? g.lineTo(sx * W, sy * H) : g.moveTo(sx * W, sy * H)); g.closePath(); g.setLineDash([3, 3]); g.strokeStyle = '#ffb02e'; g.stroke(); g.setLineDash([]);
+      g.fillStyle = '#ffb02e'; g.fillText(c.hide === 'ctx' ? 'his face (hidden)' : 'his upper body (hidden)', 8, H - 26); }
+  }
 }
 // stage (0..1) <-> video content (0..1), accounting for letterboxing, the current camera zoom and mirroring
 function stageGeom() {
@@ -990,6 +1021,14 @@ function bindFocus() {
   $('#ciFocus').onclick = () => setFocusMode(!S.focusMode);
   $('#focusLayer').addEventListener('pointerdown', onFocusTap);
   $('#ciFocusClr').onclick = () => { const c = selClip() || clips()[S.idx]; if (!c) return; mutate(() => { if (c.focus) { c.focus = null; recam(c); } else if (S.proj.focus?.[c.mediaId]) { delete S.proj.focus[c.mediaId]; clips().forEach(k => { if (k.mediaId === c.mediaId) recam(k); }); } }); };
+  $('#ciPov').onchange = (e) => { const c = selClip(); if (!c) return; const v = e.target.value, st = loadAutoSettings();
+    mutate(() => {
+      S.proj.pov = { ...(S.proj.pov || {}) }; if (v === 'auto') delete S.proj.pov[c.mediaId]; else S.proj.pov[c.mediaId] = v;
+      let k = 0;
+      clips().forEach(x => { if (x.mediaId !== c.mediaId) return;
+        if (st.hideMan !== 'off' && isThird(x.mediaId)) { x.hide = st.hideMan === 'all' || k % 5 !== 2 ? 'tight' : 'ctx'; k++; recam(x, x.cam?.type || 'medium'); }
+        else if (x.hide) { delete x.hide; recam(x); } });
+    }); seek(S.t); };
   $('#ciCam').onchange = (e) => { const c = selClip(); if (!c) return; mutate(() => recam(c, e.target.value, $('#ciFlip').checked)); seek(S.t); };
   $('#ciFlip').onchange = (e) => { const c = selClip(); if (!c?.cam) return; mutate(() => recam(c, c.cam.type, e.target.checked)); seek(S.t); };
   const L = () => LEVELS[camLevel()] || LEVELS[2], fishK = () => +$('#auFish').value || 0.18;
@@ -1017,7 +1056,7 @@ function readAutoUI() {
     camera: $('#auCam').checked, camLevel: +$('#auCamL').value,
     angles: $('#auAngles').checked, dutch: $('#auDutch').checked, fish: $('#auFish').value, extend: $('#auExtend').value, slowmo: $('#auSlow').value,
     multicam: $('#auMc').value, mcXfade: $('#auMcXf').value, mcPace: $('#auMcPace').value, mcReplay: $('#auMcReplay').value, mcReplaySlow: $('#auMcRSlow').checked,
-    keepFrame: $('#auKeep').checked, frameTight: $('#auTight').value };
+    keepFrame: $('#auKeep').checked, frameTight: $('#auTight').value, hideMan: $('#auHide').value };
 }
 function writeAutoUI(st) {
   $('#auOrder').value = st.order; $('#auXfade').value = String(st.xfade); $('#auStrict').value = st.strict;
@@ -1028,7 +1067,7 @@ function writeAutoUI(st) {
   $('#auExtend').value = String(st.extend || '0'); $('#auSlow').value = st.slowmo || 'fast';
   $('#auMc').value = st.multicam || 'auto'; $('#auMcXf').value = String(st.mcXfade ?? '0.2'); $('#auMcPace').value = st.mcPace || 'normal';
   $('#auMcReplay').value = String(st.mcReplay ?? 'auto'); $('#auMcRSlow').checked = st.mcReplaySlow !== false;
-  $('#auKeep').checked = st.keepFrame !== false; $('#auTight').value = st.frameTight || 'balanced'; $('#auTight').disabled = st.keepFrame === false;
+  $('#auKeep').checked = st.keepFrame !== false; $('#auTight').value = st.frameTight || 'balanced'; $('#auHide').value = st.hideMan || 'most'; $('#auTight').disabled = st.keepFrame === false;
   setFraming(st.keepFrame !== false);
 }
 function bindAuto() {
@@ -1041,7 +1080,7 @@ function bindAuto() {
   $('#auCancel').onclick = () => { S.autoJob?.abort(); S.exportJob?.cancel?.(); };
   $('#auExport').onclick = doExportAuto;
   $('#auCamL').oninput = () => { $('#auCamV').textContent = CAM_NAMES[$('#auCamL').value]; };
-  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace', '#auMcReplay', '#auMcRSlow', '#auKeep', '#auTight'].forEach(id => $(id).addEventListener('change', () => {
+  ['#auOrder', '#auXfade', '#auStrict', '#auColor', '#auShadows', '#auDenoise', '#auSharpen', '#auStab', '#auCam', '#auCamL', '#auAlt', '#auAngles', '#auDutch', '#auFish', '#auExtend', '#auSlow', '#auMc', '#auMcXf', '#auMcPace', '#auMcReplay', '#auMcRSlow', '#auKeep', '#auTight', '#auHide'].forEach(id => $(id).addEventListener('change', () => {
     const st = readAutoUI(); saveAutoSettings(st); setFraming(st.keepFrame !== false); $('#auCamL').disabled = !st.camera; $('#auTight').disabled = !st.keepFrame; setFraming(st.keepFrame);
     if (S.analysis.size && S.proj.autoCuts && !S.autoJob) { $('#auStatus').textContent = 'Settings changed — re-editing…'; autoEdit(null); }
   }));
@@ -1079,14 +1118,15 @@ async function autoEdit(files) {
       if (m.capture == null) m.capture = m.captureMeta || m.blob.lastModified || null;
       let an = S.analysis.get(id);
       const ta = performance.now();
-      if (an && st.keepFrame !== false && !an.posed) an = null; // analysed before "Keep her in frame" was on: redo with people detection
+      if (an && (st.keepFrame !== false || st.hideMan !== 'off') && an.pv !== 3) an = null; // analysed without (current) people detection: redo
       if (!an) {
         let pose = null;
-        if (st.keepFrame !== false) { auProg(0.9 * done / totalDur, 'Loading the people detector…'); pose = await loadPose(); }
+        if (st.keepFrame !== false || st.hideMan !== 'off') { auProg(0.9 * done / totalDur, 'Loading the people detector…'); pose = await loadPose(); }
         an = await analyzeRange(m.url, 0, m.duration, { signal: ac.signal, pose,
           onTick: (f) => auProg(0.9 * (done + f * m.duration) / totalDur, `Analyzing clip ${i + 1} of ${mids.length}…`) });
         console.info(`[auto] analysed ${m.name} (${m.duration.toFixed(1)} s) in ${Math.round(performance.now() - ta)} ms via ${an.mode}, ${an.samples.length} samples`);
-        an.posed = st.keepFrame !== false;
+        an.posed = !!pose; an.pv = 3; an.pov = classifyPov(an.samples);
+        console.info(`[framing] ${m.name}: ${an.pov.kind} (two heads ${an.pov.two}, partial ${an.pov.partial}, shake ${an.pov.shake})`);
         S.analysis.set(id, an);
       }
       done += m.duration;
@@ -1137,17 +1177,22 @@ async function autoEdit(files) {
     // Extend (only the real footage): slow-mo on the best stretches, boomerangs, replays from another angle
     const ext = extendShots(shots, st.extend, { xfade: xf.xfade, lapRef: plan.lapRef });
     shots = ext.shots;
-    if (st.camera) shots = planCamera(shots, st.camLevel, { xfade: xf.xfade, altAngle: st.altAngle, angles: st.angles, dutch: st.dutch, fish: st.fish,
+    assignHide(shots, st);
+    // planCamera splits long shots, so the 'most' pattern is re-dealt per final clip inside the fit hook
+    const hideNext = hider(st);
+    if (st.camera) { shots = planCamera(shots, st.camLevel, { xfade: xf.xfade, altAngle: st.altAngle, angles: st.angles, dutch: st.dutch, fish: st.fish,
       subjFn: (s, a, b) => subjectFromFocus(S.proj.focus?.[s.mediaId], a, b) || (st.keepFrame !== false && subjectFromProtected(s, a, b)) || null,
-      fit: st.keepFrame !== false ? (s, cam) => fitFor(s, cam, st) : null });
-    else for (const s of shots) { delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType; }
+      fit: (st.keepFrame !== false || st.hideMan !== 'off') ? (s, cam) => { hideNext(s); return fitFor(s, cam, st); } : null });
+      for (const s of shots) if (!s.cam) delete s.hide; }
+    else for (const s of shots) { delete s.wantAngle; delete s.wantFish; delete s.flipAngle; delete s.camType; if (s.hide) s.cam = fitFor(s, { type: 'medium', z0: 1, z1: 1, x0: 0.5, y0: 0.5, x1: 0.5, y1: 0.5 }, st); }
     const newClips = shots.map((s, k) => {
       const shake = s.samples?.length ? s.samples.map(x => x.shake).sort((a, b) => a - b)[Math.floor(s.samples.length / 2)] : 0;
       const e = (st.color || st.shadows || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
       const o = { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}${s.ext === 'slow' ? ' · slow-mo' : s.ext === 'boom' ? ' · boomerang' : s.ext === 'replay' ? ' · replay' : s.ext === 'angles' ? ' · every angle' : ''}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
-        enh: e, cam: st.camera ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
+        enh: e, cam: st.camera || s.hide ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
       if (s.speed && s.speed < 1) o.speed = s.speed;
       if (s.boom) o.boom = true;
+      if (s.hide) o.hide = s.hide;
       if (s.ext) o.ext = s.ext;
       if (s.mc) o.mc = { ...s.mc };
       if (s.audioFrom && s.audioFrom.mediaId !== s.mediaId) o.audioFrom = { ...s.audioFrom };
@@ -1339,6 +1384,7 @@ function markMomentAllAngles() {
     const cs = clips(); const i = cs.indexOf(c);
     const head = c.out - c.in > 0.05 ? 1 : 0; if (!head) cs.splice(i, 1);
     cs.splice(i + head, 0, ...ins, tail); S.sel = ins[0].id;
+    { const st = loadAutoSettings(); if (st.hideMan !== 'off') for (const x of ins) if (isThird(x.mediaId)) { x.hide = 'tight'; recam(x, 'medium'); } }
     (g.moments ||= []).push({ g0: +m0.toFixed(2), g1: +m1.toFixed(2), cams: seq.map(x => x.mc.cam), manual: true });
   });
   toast(`🔁 Moment replayed from ${seq.length} angles`);

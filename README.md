@@ -190,6 +190,38 @@ The detector can miss people in very dark, very close or unusual poses; those fr
 everything moving". Manual camera picks in the Clip tab are fitted too while *Keep her in frame* is on.
 The model files (~15 MB) download on first use and are cached for offline use.
 
+## 🙈 Hide his upper body on third-person shots (v13)
+
+For guy + girl videos, Auto Edit now tells **POV** clips (his head never in shot) from **third-person** clips
+(both people seen) and, on third-person shots, zooms on *her whole body + his hips / thighs* (the contact zone)
+while keeping *his head / face / shoulders / upper chest* out of the frame where possible.
+
+- **Setting** (Auto Edit): *Hide his upper body (third-person clips)* — **Most shots** (default: 4 of every 5
+  third-person shots are tight, the 5th is a slightly wider context shot that still tries to hide his face),
+  **All shots**, or **Off**. POV clips are never changed.
+- **Clip tab → Point of view**: *Auto (shows what was detected)* / *POV (keep framing)* / *Third-person*. Changing
+  it re-frames every shot of that video.
+- **Her in frame always wins**: if hiding him would cut any part of her, the shot widens (often to full frame);
+  his head is only cropped away when there is room. Works with the dynamic camera, angles / fisheye (the warp is
+  softened first, zoom kept), multi-cam, every-angle replays and Loose / Balanced / Tight.
+- **How**: the people model now also looks again at the left / right half and lower 60 % of the frame when it
+  only found one body, tells the two apart by clothing / skin colour over the clip, and picks *her* as the one
+  moving most (or your Set focus). POV = a second head is not seen repeatedly in the same place.
+  The preview overlay (👁) shows the protected box and an orange dashed box for what is being hidden.
+
+Test (synthetic, real cut-out people, 7 third-person + 3 POV clips, 6 runs): her fully in frame **100 %**
+(also in *All shots* and Bold + strong fisheye); POV / third-person detection **60 / 60**; his head visible on
+**52 %** of frames in scenes where hiding is possible (kneeling, bent over, standing apart) vs 100 % in v12, and
+82 % over all third-person frames (side-by-side standing scenes cannot hide him without cutting her). Analysis
++~0.4 s per clip; export unchanged.
+
+Limits: hiding is partial, not guaranteed — his chest / shoulders are still partly visible on most shots
+(96 % of frames) and his head on about half of the feasible ones, because her pose box is padded generously
+(missing legs, hair, movement between analysed frames) so she is never cut. Standing side by side, lying under
+her, or him filling the frame: no hide. The detector can misread a third-person clip as POV / one person
+(those shots just keep the normal framing) — use the Clip tab override. Camera shake is not measured in the
+fast analysis path, so very shaky third-person handheld clips rely on the two-heads test only.
+
 ## Features
 
 | Area | What works |
@@ -274,7 +306,8 @@ db.js                                  IndexedDB (media blobs + projects)
 render.js                              shared caption/color drawing, SRT helpers
 exporter.js                            ffmpeg.wasm export + real-time MediaRecorder export
 wcexport.js                            fast export: remux, WebCodecs decode/render/encode, mp4 muxing
-framing.js                             keep-her-in-frame: people detection, protected region, camera fitting
+framing.js                             keep-her-in-frame + hide-his-upper-body: people detection (multi-pass), her/him
+                                       identity, POV classifier, protected / exclusion regions, camera fitting
 multicam.js                            multi-cam: audio sync (onset xcorr + GCC-PHAT), grouping, camera switching plan
 fx.js                                  WebGL renderer (camera, angles, fisheye, color, blend) shared by preview + exports
 ai.js                                  silence/motion/black detection, auto color, transcript timing

@@ -88,6 +88,25 @@ The fast path skips denoise/stabilize; boomerang reverse frames are cached at �
 encoded pieces and the final MP4 live in the tab's memory. Real-time export (Export tab) is the fallback; it applies color,
 camera moves and crossfades, but not denoise or sharpen.
 
+## ✂️ Crop, fill and colour fixes (v14)
+
+**Crop tool (Clip tab → ✂️ Crop).** Upload the original video and crop in the app instead of in Photos.
+- Tap a clip, then **✂️ Crop**. The preview shows the whole, untouched frame with a white crop box.
+- Drag inside the box to move it; drag a corner to resize it. Pick a shape: **Free · 9:16 · 4:5 · 1:1 · 16:9**.
+- **All shots from this video** (on by default) crops every shot cut from that video, and future Auto Edit runs too.
+- **✓ Done** applies it, **Cancel** leaves it, **Reset** goes back to the whole frame. **Reset crop** in the Clip tab removes it later. Undo works.
+- The crop is applied first: auto-framing, zooms, "keep her in frame" and "hide his upper body" all work inside the cropped picture, and every export (hardware, ffmpeg, real-time) uses it.
+
+**Black bars (Clip tab → Black bars, all clips).** The output frame takes the shape most of the edit is in (portrait, square or landscape).
+- **Auto** (default): a clip of a slightly different shape fills the frame when at most ~25% would be lost.
+- **Always fill**: no black bars ever, so very different shapes get cropped more.
+- **Show whole video**: the old behaviour, with letterboxing.
+
+**Colour fixes.**
+- Automatic shadow lifting is gentler, at most 0.5 (older projects with up to 0.85 are capped too).
+- The automatic brightness, contrast and saturation no longer stack on top of a shadow lift. That stacking clipped skin tones into a washed-out pink/orange with banding.
+- HDR videos (iPhone HDR / Dolby Vision / HLG, BT.2020; edits and crops made in Photos usually stay HDR) are detected. They get no automatic colour or shadow changes, because the browser already tone-maps them. The Clip tab shows "Auto (off · HDR video)".
+
 ## 🌗 Shadow recovery (brighten dark areas)
 Dark corners and underexposed clips get a local shadow lift. **⚡ Auto Edit** measures each clip's shadow fraction
 (share of luma below 20 %) and applies it automatically (Auto Edit settings → **🌗 Brighten dark areas**, on by default).

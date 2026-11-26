@@ -1,6 +1,6 @@
 // Export engines: (1) ffmpeg.wasm (single-thread, no special headers needed), (2) real-time canvas + MediaRecorder.
 import { FFmpeg } from './vendor/ffmpeg/index.js';
-import { shadowAmt, shadowFF, cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish, programAudio } from './render.js';
+import { shadowAmt, shadowFF, cssFilter, warmthColor, drawCaption, containRect, outputSize, ffColorFilter, clipColor, camAt, camFF, enhFF, xfadeDurations, warpFF, clipDur, fwdDur, clipSpeed, camP, srcAt, hasWarp, hasFish, programAudio, viewCrop, cropFF } from './render.js';
 import { createFx } from './fx.js';
 
 let ff = null;
@@ -114,7 +114,8 @@ export async function exportFF(proj, media, opts) {
   let concatIn = '';
   clips.forEach((c, i) => {
     const d = (c.out - c.in).toFixed(3);
-    fc.push(`[${i}:v]setpts=PTS-STARTPTS,scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,trim=duration=${d}[v${i}]`);
+    const cf = cropFF(viewCrop(c, W, H, proj.fill)); 
+    fc.push(`[${i}:v]setpts=PTS-STARTPTS,${cf ? cf + ',' : ''}scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,trim=duration=${d}[v${i}]`);
     if (files.get(c.mediaId).hasAudio && !c.muted) {
       fc.push(`[${i}:a]asetpts=PTS-STARTPTS,aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=duration=${d}[a${i}]`);
     } else {
@@ -218,13 +219,14 @@ export function createRealtimeExport(proj, media, opts) {
       ctx.save();
       ctx.globalAlpha = alpha;
       if (hasFilter) ctx.filter = cssFilter(clipColor(proj, c));
-      if (fx && fx.draw(src, sw, sh, c.cam || null, p, { shadow: shadowAmt(c) })) ctx.drawImage(fx.canvas, 0, 0, W, H);
+      if (fx && fx.draw(src, sw, sh, c.cam || null, p, { shadow: shadowAmt(c), crop: viewCrop(c, W, H, proj.fill) })) ctx.drawImage(fx.canvas, 0, 0, W, H);
       else {
         if (c.cam?.flip) { ctx.translate(W, 0); ctx.scale(-1, 1); }
         const { z, cx, cy } = camAt(c.cam || null, p);
-        const [dx, dy, dw, dh] = containRect(sw, sh, W, H);
-        if (z > 1.0005) { const ww = W / z, hh = H / z, sx = cx * W - ww / 2, sy = cy * H - hh / 2, k = W / ww; ctx.drawImage(src, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k); }
-        else ctx.drawImage(src, dx, dy, dw, dh);
+        const r = viewCrop(c, W, H, proj.fill) || [0, 0, 1, 1], s0 = [r[0] * sw, r[1] * sh, (r[2] - r[0]) * sw, (r[3] - r[1]) * sh];
+        const [dx, dy, dw, dh] = containRect(s0[2], s0[3], W, H);
+        if (z > 1.0005) { const ww = W / z, hh = H / z, sx = cx * W - ww / 2, sy = cy * H - hh / 2, k = W / ww; ctx.drawImage(src, ...s0, (dx - sx) * k, (dy - sy) * k, dw * k, dh * k); }
+        else ctx.drawImage(src, ...s0, dx, dy, dw, dh);
       }
       ctx.restore();
     };
@@ -400,12 +402,14 @@ export async function exportChunked(proj, media, opts) {
     const sp = clipSpeed(c), boom = !!c.boom;
     const interp = sp < 0.999 && srcFps.get(c.mediaId) * sp < 29; // slow motion that needs new in-between frames
     const cam = c.cam && (c.cam.z0 > 1.001 || c.cam.z1 > 1.001) ? c.cam : null;
-    let k = cam && !c.enh?.stab ? Math.min(2, Math.max(1, Math.min(c.w || W, c.h || H) / Math.min(W, H))) : 1;
+    const vc = viewCrop(c, W, H, proj.fill), [vw, vh] = vc ? [(c.w || W) * (vc[2] - vc[0]), (c.h || H) * (vc[3] - vc[1])] : [c.w || W, c.h || H];
+    let k = cam && !c.enh?.stab ? Math.min(2, Math.max(1, Math.min(vw, vh) / Math.min(W, H))) : 1;
     if (interp && slowMode === 'smooth') k = 1; // motion interpolation is the slow part: run it at output size
     const NW = Math.round(W * k / 2) * 2, NH = Math.round(H * k / 2) * 2;
     const v = [`[${inIdx}:v]setpts=PTS-STARTPTS`];
     if (sp < 0.999) v.push(`setpts=PTS/${sp.toFixed(4)}`);
     if (!interp) v.push(`fps=${FPS}`);
+    if (vc) v.push(cropFF(vc));
     v.push(`scale=${NW}:${NH}:force_original_aspect_ratio=decrease`, `pad=${NW}:${NH}:(ow-iw)/2:(oh-ih)/2:black`, 'setsar=1');
     if (interp) v.push(slowMode === 'smooth' ? `minterpolate=fps=${FPS}:mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=epzs:search_param=16` : `framerate=fps=${FPS}`, `fps=${FPS}`);
     if (c.enh?.stab) v.push('deshake=rx=32:ry=32:edge=mirror');

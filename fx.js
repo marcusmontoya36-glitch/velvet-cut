@@ -12,7 +12,7 @@ uniform vec3 h0; uniform vec3 h1; uniform vec3 h2; uniform float useH;
 uniform vec3 crop; uniform vec4 box; uniform float fish; uniform float aspect; uniform float flip;
 uniform float rot; uniform float mixW; uniform float alpha; uniform float gain;
 uniform vec3 col; uniform vec4 warm; uniform float sharp; uniform vec2 texel; uniform float useCol;
-uniform sampler2D tb; uniform float shadow;
+uniform sampler2D tb; uniform float shadow; uniform vec4 scr; // source crop: x0, y0, w, h (displayed orientation)
 // shadow recovery: same formula as render.js shadowK / shadowFF
 float shK(float Y, float B, float P) {
   float Q = sqrt(max(Y, 0.0));
@@ -31,7 +31,7 @@ vec2 rawUv(vec2 s) { // displayed orientation -> stored texture orientation (pho
   return vec2(1.0 - s.y, s.x);
 }
 vec3 samp(vec2 s) {
-  vec2 r = rawUv(s);
+  vec2 r = rawUv(scr.xy + s * scr.zw);
   vec3 c0 = texture2D(t, r).rgb, c = c0;
   if (mixW > 0.0) c = mix(c, texture2D(t2, r).rgb, mixW);
   vec3 n = vec3(0.0);
@@ -114,7 +114,7 @@ export function createFx(canvas, ctxOpts = {}) {
     return tex;
   };
   const tex = mkTex(0), tex2 = mkTex(1);
-  const U = {}; ['t', 't2', 'tb', 'shadow', 'h0', 'h1', 'h2', 'useH', 'crop', 'box', 'fish', 'aspect', 'flip', 'rot', 'mixW', 'alpha', 'gain', 'col', 'warm', 'sharp', 'texel', 'useCol'].forEach(n => U[n] = gl.getUniformLocation(pr, n));
+  const U = {}; ['t', 't2', 'tb', 'shadow', 'h0', 'h1', 'h2', 'useH', 'crop', 'box', 'fish', 'aspect', 'flip', 'rot', 'mixW', 'alpha', 'gain', 'col', 'warm', 'sharp', 'texel', 'useCol', 'scr'].forEach(n => U[n] = gl.getUniformLocation(pr, n));
   gl.uniform1i(U.t, 0); gl.uniform1i(U.t2, 1); gl.uniform1i(U.tb, 2);
   // ---- shadow base passes (lazy) ----
   let SB = null;
@@ -153,7 +153,7 @@ export function createFx(canvas, ctxOpts = {}) {
   /**
    * draw src (video / canvas / ImageBitmap / VideoFrame, displayed size sw×sh) with cam at progress p.
    * o (optional): { layer: true (blend over what's there instead of replacing), alpha, gain, src2 + mix (frame blend),
-   *   color: {b,c,s}, warm: [r,g,b,a], sharp, rot (0..3 quarter turns of the stored frame), shadow (0..1 lift) }
+   *   color: {b,c,s}, warm: [r,g,b,a], sharp, rot (0..3 quarter turns of the stored frame), shadow (0..1 lift), crop: [x0,y0,x1,y1] source crop }
    */
   function draw(src, sw, sh, cam, p, o = {}) {
     const W = canvas.width, H = canvas.height;
@@ -169,7 +169,10 @@ export function createFx(canvas, ctxOpts = {}) {
     }
     gl.uniform1f(U.shadow, shd > 0 && SB ? shd : 0);
     const { z, cx, cy } = camAt(cam || null, p);
-    const [dx, dy, dw, dh] = containRect(sw, sh, W, H);
+    // o.crop = [x0, y0, x1, y1] of the displayed source (the clip's crop): only that part is shown, fitted to the frame
+    const sc = o.crop && o.crop.length === 4 ? o.crop : [0, 0, 1, 1];
+    gl.uniform4f(U.scr, sc[0], sc[1], sc[2] - sc[0], sc[3] - sc[1]);
+    const [dx, dy, dw, dh] = containRect(sw * (sc[2] - sc[0]), sh * (sc[3] - sc[1]), W, H);
     gl.uniform3f(U.crop, z, cx, cy);
     gl.uniform4f(U.box, dx / W, dy / H, dw / W, dh / H);
     gl.uniform1f(U.aspect, W / H);

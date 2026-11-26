@@ -75,11 +75,52 @@ export function containRect(sw, sh, W, H) {
   return [(W - w) / 2, (H - h) / 2, w, h];
 }
 
+// ---- crop (per clip, in displayed-source coordinates [x0, y0, x1, y1], 0..1) and fill ----
+export const CROP_ASPECTS = { free: 0, '9:16': 9 / 16, '4:5': 4 / 5, '1:1': 1, '16:9': 16 / 9 };
+export function clipCrop(c) {
+  const r = c?.crop;
+  if (!Array.isArray(r) || r.length !== 4 || !(r[2] - r[0] > 0.02) || !(r[3] - r[1] > 0.02)) return null;
+  if (r[0] <= 0.001 && r[1] <= 0.001 && r[2] >= 0.999 && r[3] >= 0.999) return null;
+  return r;
+}
+/** size of the part of the source a clip shows (after its crop) */
+export function shownSize(c) {
+  const r = clipCrop(c) || [0, 0, 1, 1];
+  return [(c?.w || 1280) * (r[2] - r[0]), (c?.h || 720) * (r[3] - r[1])];
+}
+/**
+ * The source rectangle actually shown in a W×H frame: the clip's crop, then (fill) trimmed to the frame's shape
+ * so there are no black bars. fill: 'auto' (only when at most ~25% would be lost), 'always', 'off'.
+ * Returns null when the whole source is shown (contained).
+ */
+export function viewCrop(c, W, H, fill = 'auto') {
+  const r = clipCrop(c);
+  if (fill === 'off' || !W || !H) return r;
+  const [sw, sh] = shownSize(c), a = sw / sh, A = W / H, keep = Math.min(a / A, A / a);
+  const fc = Array.isArray(c?.fc) ? c.fc : null; // where the people are in this shot (source 0..1), from the analysis
+  if (keep > 0.985 || (fill !== 'always' && keep < (fc ? 0.6 : 0.75))) return r;
+  let [x0, y0, x1, y1] = r || [0, 0, 1, 1];
+  if (a > A) { const w = (x1 - x0) * A / a; const nx = fc ? Math.max(x0, Math.min(x1 - w, fc[0] - w / 2)) : x0 + ((x1 - x0) - w) / 2; x0 = nx; x1 = x0 + w; }
+  else { const h = (y1 - y0) * a / A; const ny = fc ? Math.max(y0, Math.min(y1 - h, fc[1] - h * 0.45)) : y0 + ((y1 - y0) - h) * 0.4; y0 = ny; y1 = y0 + h; } // keep a bit more of the top (faces)
+  return [x0, y0, x1, y1];
+}
+/** ffmpeg crop filter for a source rectangle (after autorotate, so displayed orientation), '' for none */
+export function cropFF(r) {
+  if (!r) return '';
+  const f = (x) => (+x).toFixed(5);
+  return `crop=trunc(iw*${f(r[2] - r[0])}/2)*2:trunc(ih*${f(r[3] - r[1])}/2)*2:trunc(iw*${f(r[0])}):trunc(ih*${f(r[1])})`;
+}
+/** output frame: the shape (portrait / square / landscape) most of the edit is in, sized like its first clip */
 export function outputSize(clips, res) {
-  const c = clips[0];
-  let w = c?.w || 1280, h = c?.h || 720;
+  const kind = (c) => { const [w, h] = shownSize(c), a = w / h; return a > 1.15 ? 'L' : a < 0.87 ? 'P' : 'S'; };
+  const tot = {}; for (const x of clips) if (x?.w && x?.h) tot[kind(x)] = (tot[kind(x)] || 0) + Math.max(0.1, (x.out ?? 1) - (x.in ?? 0));
+  const best = Object.keys(tot).sort((a, b) => tot[b] - tot[a])[0];
+  const c = (best && clips.find(x => x?.w && x?.h && kind(x) === best)) || clips[0];
+  let [w, h] = c?.w ? shownSize(c) : [1280, 720];
   if (res !== 'src') {
-    const s = Math.min(1, +res / Math.min(w, h)); // never upscale
+    // never upscale past the source: a cropped clip may come back up to the size class of its uncropped video
+    const up = c?.w ? Math.max(1, Math.min(c.w, c.h) / Math.max(1, Math.min(w, h))) : 1;
+    const s = Math.min(up, +res / Math.min(w, h));
     w *= s; h *= s;
   }
   return [Math.max(2, Math.round(w / 2) * 2), Math.max(2, Math.round(h / 2) * 2)];
@@ -114,8 +155,12 @@ export function parseSrt(txt) {
 // Combined colour = project colour × clip auto-enhance.
 export function clipColor(proj, clip) {
   const p = proj.color, e = clip?.enh;
-  if (!e) return p;
-  return { b: p.b + (e.b || 0), c: p.c * (e.c || 1), s: p.s * (e.s || 1), w: p.w };
+  if (!e || e.hdr) return p; // HDR sources get no automatic grade (also fixes projects saved before v14)
+  let b = e.b || 0, c = e.c || 1, s = e.s || 1;
+  // the automatic grade never stacks on top of a shadow lift: brightening + contrast + saturation over lifted
+  // shadows pushed skin into clipping (washed-out, pink/orange, banded). Also applied to clips from older projects.
+  if (shadowAmt(clip) >= 0.05) { b = Math.min(b, 0.03); c = Math.min(c, 1.05); s = Math.min(s, 1.05); }
+  return { b: p.b + b, c: p.c * c, s: p.s * s, w: p.w };
 }
 const ease = (p) => (1 - Math.cos(Math.PI * Math.max(0, Math.min(1, p)))) / 2;
 // Camera state at progress p (0..1) through the clip: zoom z and the normalized centre of the crop window.
@@ -286,7 +331,8 @@ export function cropToOut(cam, x, y, aspect = 16 / 9) {
 // Multiplying R, G and B by the same k keeps hue and skin tones (no colour cast).
 export const SHADOW_BASE = 64;
 export const shadowAmt = (c) => {
-  const v = c?.shadow != null ? c.shadow / 100 : (c?.enh?.shadow || 0);
+  // automatic lift is capped at 0.5 (older projects could carry up to 0.85); a hand-set slider value is used as is
+  const v = c?.shadow != null ? c.shadow / 100 : (c?.enh?.hdr ? 0 : Math.min(0.5, c?.enh?.shadow || 0));
   return Math.max(0, Math.min(1, +v || 0));
 };
 export const SHADOW_PEAK = 0.8; // headroom for the auto grade after the lift (brightness x1.12, contrast 1.15)

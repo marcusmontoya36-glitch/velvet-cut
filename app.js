@@ -1,9 +1,9 @@
 import * as DB from './db.js';
-import { shadowAmt, cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut, programAudio } from './render.js';
+import { shadowAmt, cssFilter, warmthColor, fmtTime, toSrt, parseSrt, outputSize, FONT_STACK, clipColor, camCss, xfadeDurations, containRect, camAt, clipDur, fwdDur, clipSpeed, srcAt, camP, hasFish, outToCrop, cropToOut, programAudio, viewCrop, clipCrop, CROP_ASPECTS } from './render.js';
 import { audioFeatures, groupClips, planMulticam, camsCovering, addAngleReplays, replaySequence } from './multicam.js';
 import { createFx } from './fx.js';
 import { exportChunked, cancelFF, createRealtimeExport, once } from './exporter.js';
-import { canRemux, remuxExport, wcBlocker, createWcExport } from './wcexport.js';
+import { canRemux, remuxExport, wcBlocker, createWcExport, videoColor } from './wcexport.js';
 import { analyzeRange, planEdit, planCamera, enhanceFor, orderShots, readCaptureTime, loadAutoSettings, saveAutoSettings, unlockAnalysis, camFor, subjectOf, subjectFromFocus, LEVELS, CAM_TYPES, trackPoint, makeTemplate, grayOf, parseXf, xfValue, lookOf, extendShots, editLength, setFraming } from './autoedit.js';
 import { loadPose, poseStatus, fitCam, shotKeys, protectedOf, boxUnion, TIGHTNESS, classifyPov, hideKeys, fitHide } from './framing.js';
 import { suggestCuts, videoStats, autoColor, timeTranscript } from './ai.js';
@@ -266,7 +266,8 @@ function fxDraw(el, c, p, src) {
   const w = Math.min(1280, Math.round(st.clientWidth * dpr)), h = Math.round(w * st.clientHeight / Math.max(1, st.clientWidth));
   if (o.cv.width !== w || o.cv.height !== h) { o.cv.width = w; o.cv.height = h; }
   src = src || el;
-  const ok = o.fx.draw(src, src.videoWidth || src.width, src.videoHeight || src.height, c.cam, p, { shadow: shadowAmt(c) });
+  const [OW, OH] = outSize();
+  const ok = o.fx.draw(src, src.videoWidth || src.width, src.videoHeight || src.height, c.cam, p, { shadow: shadowAmt(c), crop: S.cropEdit?.clipId === c.id ? null : viewCrop(c, OW, OH, S.proj.fill) });
   const f = cssFilter(clipColor(S.proj, c)); if (o.cv.style.filter !== f) o.cv.style.filter = f;
   o.cv.style.zIndex = el.style.zIndex || getComputedStyle(el).zIndex || 0;
   if (ok !== o.on) { o.on = ok; setOp(el, el._op ?? +(el.style.opacity || 1)); }
@@ -378,8 +379,10 @@ function lookFor(el, c, p, src) {
   const f = cssFilter(clipColor(S.proj, c));
   if (el.style.filter !== f) el.style.filter = f;
   el.style.transform = c.cam ? camCss(c.cam, p, el.clientWidth || 1600, el.clientHeight || 900) : '';
-  // fisheye, shadow recovery (and boomerang reverse frames) need WebGL; everything else is a CSS transform on the <video>
-  if ((hasFish(c.cam) || src || shadowAmt(c) > 0) && fxDraw(el, c, p, src)) return;
+  // fisheye, shadow recovery, crop / fill (and boomerang reverse frames) need WebGL; everything else is a CSS transform on the <video>
+  const [OW, OH] = outSize(), editing = S.cropEdit?.clipId === c.id;
+  if (editing) { el.style.transform = ''; el.style.filter = ''; fxOff(el); return; } // crop tool: show the whole, untouched frame
+  if ((hasFish(c.cam) || src || shadowAmt(c) > 0 || viewCrop(c, OW, OH, S.proj.fill)) && fxDraw(el, c, p, src)) return;
   fxOff(el);
 }
 function applyLook() {
@@ -408,8 +411,9 @@ function tickUI() {
 // ---------------- stage sizing / color ----------------
 function fitStage() {
   const wrap = $('#stageWrap'), st = $('#stage');
-  const c = clips()[0];
-  const ar = c && c.w && c.h ? c.w / c.h : 16 / 9;
+  const ec = S.cropEdit && clips().find(x => x.id === S.cropEdit.clipId);
+  const [OW, OH] = ec ? [ec.w || 16, ec.h || 9] : clips().length ? outSize() : [16, 9];
+  const ar = OW / OH;
   const W = wrap.clientWidth, H = wrap.clientHeight;
   let w = W, h = W / ar; if (h > H) { h = H; w = H * ar; }
   st.style.width = w + 'px'; st.style.height = h + 'px'; st.style.aspectRatio = 'auto';
@@ -581,7 +585,9 @@ function renderClipInspector() {
   $('#ciBoom').checked = !!c.boom;
   const shv = Math.round(shadowAmt(c) * 100), shAuto = c.shadow == null;
   if (document.activeElement !== $('#ciShadow')) $('#ciShadow').value = shv;
-  $('#ciShadowV').textContent = shAuto ? (c.enh?.shadow ? `Auto (${shv})` : 'Auto (off)') : String(shv);
+  $('#ciShadowV').textContent = shAuto ? (c.enh?.hdr ? 'Auto (off · HDR video)' : c.enh?.shadow ? `Auto (${shv})` : 'Auto (off)') : String(shv);
+  { const cr = clipCrop(c); $('#ciCrop').textContent = cr ? `✂️ Crop (${Math.round((cr[2] - cr[0]) * 100)}×${Math.round((cr[3] - cr[1]) * 100)}%)` : '✂️ Crop'; $('#ciCrop').classList.toggle('on', !!cr); $('#ciCropReset').disabled = !cr; }
+  $('#pjFill').value = S.proj.fill || 'auto';
   $('#ciShadowAuto').checked = shAuto;
   renderMcPicker(c);
   const fo = c.focus || S.proj.focus?.[c.mediaId];
@@ -600,7 +606,7 @@ function renderCapInspector() {
   $('#cpX').value = c.x; $('#cpY').value = c.y; $('#cpColor').value = c.color; $('#cpBox').checked = !!c.box;
 }
 function selectCap(id) { S.selCap = id; showTab('text'); renderCapInspector(); renderTimeline(); renderCapsOverlay.dirty = true; renderCapsOverlay(); }
-function renderAll() { const ex = $('#exXf'); if (ex) ex.value = xfValue(S.proj); renderAuto(); renderTimeline(); renderClipInspector(); renderCapInspector(); applyColor(); fitStage(); renderCapsOverlay.dirty = true; renderCapsOverlay(); renderSugg(); }
+function renderAll() { fitStage(); const ex = $('#exXf'); if (ex) ex.value = xfValue(S.proj); renderAuto(); renderTimeline(); renderClipInspector(); renderCapInspector(); applyColor(); fitStage(); renderCapsOverlay.dirty = true; renderCapsOverlay(); renderSugg(); }
 function showTab(name) {
   $$('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   $$('.panel').forEach(p => p.classList.toggle('on', p.id === 'tab-' + name));
@@ -862,7 +868,14 @@ function downloadText(name, text) {
 // ---------------- Focus point + per-clip framing ----------------
 const camLevel = () => +($('#auCamL')?.value || 2);
 function subjForClip(c, a = c.in, b = c.out) {
-  return subjectFromFocus(c.focus || S.proj.focus?.[c.mediaId], a, b) || (keepFrameOn() && subjectFromProtected(c, a, b)) || subjectOf(S.analysis.get(c.mediaId)?.samples, a, b);
+  const pr = keepFrameOn() && subjectFromProtected(c, a, b); // already in frame coordinates
+  if (pr && !(c.focus || S.proj.focus?.[c.mediaId])) return pr;
+  const s = subjectFromFocus(c.focus || S.proj.focus?.[c.mediaId], a, b) || pr || subjectOf(S.analysis.get(c.mediaId)?.samples, a, b);
+  if (!s || s === pr) return s;
+  // source coordinates -> frame coordinates (crop / fill / letterbox)
+  const { f } = frameMap(c.mediaId, c), m = (x, y) => { const q = f([x, y, x, y]); return [q[0], q[1]]; };
+  const [cx, cy] = m(s.cx, s.cy), [cx1, cy1] = m(s.cx1 ?? s.cx, s.cy1 ?? s.cy);
+  return { ...s, cx, cy, cx1, cy1 };
 }
 function recam(c, type = c.cam?.type, flip = c.cam?.flip, look = lookOf(c.cam)) {
   c.cam = !type || type === 'none' ? null : camFor(type, subjForClip(c), LEVELS[camLevel()] || LEVELS[2], !!flip, look);
@@ -877,15 +890,20 @@ function focusAtFor(c) {
     const q = tr.reduce((m, k) => Math.abs(k.t - t) < Math.abs(m.t - t) ? k : m, tr[0]); return { x: q.x, y: q.y }; };
 }
 // source box (0..1 of the video) -> output frame (0..1), clips with another aspect are letterboxed into the first clip's frame
-function frameMap(mediaId) {
+// and only the cropped / filled part of the source (viewCrop) is in the frame
+function frameMap(mediaId, c) {
   const m = S.media.get(mediaId), [W, H] = outputSize(clips().length ? clips() : [{ w: m?.w, h: m?.h }], 'src');
-  const [dx, dy, dw, dh] = containRect(m?.w || W, m?.h || H, W, H);
-  const f = (b) => b && [(dx + b[0] * dw) / W, (dy + b[1] * dh) / H, (dx + b[2] * dw) / W, (dy + b[3] * dh) / H];
+  const sw = m?.w || c?.w || W, sh = m?.h || c?.h || H;
+  const r = viewCrop({ w: sw, h: sh, crop: c && c.crop !== undefined ? c.crop : S.proj.crops?.[mediaId] }, W, H, S.proj.fill) || [0, 0, 1, 1];
+  const [dx, dy, dw, dh] = containRect(sw * (r[2] - r[0]), sh * (r[3] - r[1]), W, H);
+  const X = (x) => clamp((dx + (x - r[0]) / (r[2] - r[0]) * dw) / W, 0, 1), Y = (y) => clamp((dy + (y - r[1]) / (r[3] - r[1]) * dh) / H, 0, 1);
+  const f = (b) => b && [X(b[0]), Y(b[1]), Math.max(X(b[2]), X(b[0]) + 0.01), Math.max(Y(b[3]), Y(b[1]) + 0.01)];
   return { f, aspect: W / H };
 }
+const outSize = () => outputSize(clips(), 'src');
 function keysFor(c, a = c.in, b = c.out) {
   const sm = S.analysis.get(c.mediaId)?.samples; if (!sm?.length) return [];
-  const { f } = frameMap(c.mediaId);
+  const { f } = frameMap(c.mediaId, c);
   return shotKeys(sm, a, b, focusAtFor(c)).map(k => ({ p: k.p, box: f(k.box) }));
 }
 function subjectFromProtected(c, a, b) {
@@ -912,7 +930,7 @@ function fitFor(c, cam, st = loadAutoSettings()) {
   if (cam && c.hide && st.hideMan !== 'off' && isThird(c.mediaId)) {
     const sm = S.analysis.get(c.mediaId)?.samples;
     if (sm?.length) {
-      const { f, aspect } = frameMap(c.mediaId), ctx = c.hide === 'ctx';
+      const { f, aspect } = frameMap(c.mediaId, c), ctx = c.hide === 'ctx';
       const keys = hideKeys(sm, c.in, c.out, focusAtFor(c), ctx).map(k => ({ p: k.p, box: f(k.box), ex: f(k.ex) }));
       const T = TIGHTNESS[st.frameTight] || TIGHTNESS.balanced;
       if (keys.length) return fitHide(cam, keys, { margin: T.margin, aspect, ctx, zMax: st.frameTight === 'loose' ? 2 : 2.5 });
@@ -921,7 +939,7 @@ function fitFor(c, cam, st = loadAutoSettings()) {
   if (!cam || st.keepFrame === false) return cam;
   const keys = keysFor(c); if (!keys.length) return cam;
   const T = TIGHTNESS[st.frameTight] || TIGHTNESS.balanced;
-  return fitCam(cam, keys, { margin: T.margin, zoomK: T.zoomK, aspect: frameMap(c.mediaId).aspect });
+  return fitCam(cam, keys, { margin: T.margin, zoomK: T.zoomK, aspect: frameMap(c.mediaId, c).aspect });
 }
 // preview overlay: the protected box drawn through the current camera
 function renderProtBox() {
@@ -957,18 +975,21 @@ function renderProtBox() {
 // stage (0..1) <-> video content (0..1), accounting for letterboxing, the current camera zoom and mirroring
 function stageGeom() {
   const st = $('#stage'), W = st.clientWidth, H = st.clientHeight, c = clips()[S.idx];
-  const [dx, dy, dw, dh] = containRect(player.videoWidth || W, player.videoHeight || H, W, H);
+  const [OW, OH] = outSize(), r = (c && S.cropEdit?.clipId !== c.id && viewCrop(c, OW, OH, S.proj.fill)) || [0, 0, 1, 1];
+  const [dx, dy, dw, dh] = containRect((player.videoWidth || W) * (r[2] - r[0]), (player.videoHeight || H) * (r[3] - r[1]), W, H);
   const p = c ? camP(c, clamp(S.t - starts()[S.idx], 0, clipDur(c))) : 0;
-  return { W, H, dx, dy, dw, dh, cam: camAt(c?.cam || null, p), flip: !!c?.cam?.flip, look: c?.cam || null };
+  return { W, H, dx, dy, dw, dh, r, cam: camAt(c?.cam || null, p), flip: !!c?.cam?.flip, look: c?.cam || null };
 }
 function stageToContent(sx, sy) {
   const g = stageGeom(); if (g.flip) sx = 1 - sx;
   [sx, sy] = outToCrop(g.look, sx, sy, g.W / g.H);
   const ex = g.cam.cx + (sx - 0.5) / g.cam.z, ey = g.cam.cy + (sy - 0.5) / g.cam.z;
-  return [clamp((ex * g.W - g.dx) / g.dw, 0, 1), clamp((ey * g.H - g.dy) / g.dh, 0, 1)];
+  const u = clamp((ex * g.W - g.dx) / g.dw, 0, 1), v = clamp((ey * g.H - g.dy) / g.dh, 0, 1);
+  return [g.r[0] + u * (g.r[2] - g.r[0]), g.r[1] + v * (g.r[3] - g.r[1])];
 }
 function contentToStage(x, y) {
   const g = stageGeom();
+  x = (x - g.r[0]) / (g.r[2] - g.r[0]); y = (y - g.r[1]) / (g.r[3] - g.r[1]);
   const ex = (g.dx + x * g.dw) / g.W, ey = (g.dy + y * g.dh) / g.H;
   let sx = 0.5 + (ex - g.cam.cx) * g.cam.z, sy = 0.5 + (ey - g.cam.cy) * g.cam.z;
   [sx, sy] = cropToOut(g.look, sx, sy, g.W / g.H);
@@ -1016,6 +1037,105 @@ async function onFocusTap(e) {
   });
   toast(track.length ? `Focus set and tracked ✓ (${track.length} points)` : 'Focus set ✓ (fixed point)');
   seek(S.t);
+}
+// ---------------- Crop tool (per clip; before auto-framing and in every export) ----------------
+const cropRound = (r) => r.map(v => +clamp(v, 0, 1).toFixed(4));
+function cropTargets(c, all) { return all ? clips().filter(k => k.mediaId === c.mediaId) : [c]; }
+function startCrop() {
+  const c = selClip() || clips()[S.idx]; if (!c) return toast('Tap a clip first');
+  if (S.focusMode) setFocusMode(false);
+  pause();
+  const i = clips().indexOf(c); if (i !== S.idx) seek(starts()[i] + 0.05);
+  S.cropEdit = { clipId: c.id, r: (clipCrop(c) || [0, 0, 1, 1]).slice(), aspect: 'free' };
+  document.body.classList.add('cropping');
+  $('#cropLayer').hidden = false; $('#cropBar').hidden = false;
+  $('#cropAsp').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.a === 'free'));
+  fitStage(); seek(S.t); drawCropRect();
+  $('#stage').scrollIntoView?.({ block: 'center' }); // phones: the Crop button sits below the preview
+}
+function endCrop(apply) {
+  const E = S.cropEdit; if (!E) return;
+  S.cropEdit = null;
+  document.body.classList.remove('cropping');
+  $('#cropLayer').hidden = true; $('#cropBar').hidden = true;
+  const c = clips().find(k => k.id === E.clipId);
+  if (apply && c) {
+    const all = $('#cropAll').checked, r = cropRound(E.r), full = !clipCrop({ crop: r });
+    mutate(() => {
+      for (const k of cropTargets(c, all)) { if (full) delete k.crop; else k.crop = r.slice(); if (k.cam) recam(k); }
+      if (all) S.proj.crops = { ...(S.proj.crops || {}), [c.mediaId]: full ? [0, 0, 1, 1] : r.slice() };
+    });
+    toast(full ? 'Crop removed' : 'Cropped ✓');
+  }
+  fitStage(); seek(S.t);
+}
+function resetCrop() {
+  const c = selClip() || clips()[S.idx]; if (!c) return;
+  mutate(() => { for (const k of clips()) if (k.mediaId === c.mediaId || k === c) { delete k.crop; if (k.cam) recam(k); } S.proj.crops = { ...(S.proj.crops || {}), [c.mediaId]: [0, 0, 1, 1] }; });
+  fitStage(); seek(S.t); toast('Crop reset — whole video');
+}
+function drawCropRect() {
+  const E = S.cropEdit; if (!E) return;
+  const el = $('#cropRect'), [x0, y0, x1, y1] = E.r;
+  el.style.left = x0 * 100 + '%'; el.style.top = y0 * 100 + '%'; el.style.width = (x1 - x0) * 100 + '%'; el.style.height = (y1 - y0) * 100 + '%';
+}
+// aspect (width / height in pixels) -> the largest box of that shape centred on the current box
+function cropToAspect(E, a) {
+  const st = $('#stage'), W = st.clientWidth || 1, H = st.clientHeight || 1, c = clips().find(k => k.id === E.clipId);
+  const A = CROP_ASPECTS[a]; if (!A) return;
+  const ar = (c?.w || W) / (c?.h || H); // source aspect: normalized units -> pixels
+  const cx = (E.r[0] + E.r[2]) / 2, cy = (E.r[1] + E.r[3]) / 2;
+  let w = 1, h = ar / A; if (h > 1) { h = 1; w = A / ar; }
+  const x0 = clamp(cx - w / 2, 0, 1 - w), y0 = clamp(cy - h / 2, 0, 1 - h);
+  E.r = [x0, y0, x0 + w, y0 + h];
+}
+function bindCrop() {
+  $('#ciCrop').onclick = startCrop;
+  $('#ciCropReset').onclick = resetCrop;
+  $('#pjFill').onchange = (e) => { mutate(() => { S.proj.fill = e.target.value; clips().forEach(k => { if (k.cam) recam(k); }); }); fitStage(); seek(S.t); };
+  $('#cropDone').onclick = () => endCrop(true);
+  $('#cropCancel').onclick = () => endCrop(false);
+  $('#cropReset').onclick = () => { const E = S.cropEdit; if (!E) return; E.r = [0, 0, 1, 1]; if (E.aspect !== 'free') cropToAspect(E, E.aspect); drawCropRect(); };
+  $('#cropAsp').onclick = (e) => {
+    const b = e.target.closest('button'); const E = S.cropEdit; if (!b || !E) return;
+    E.aspect = b.dataset.a; $('#cropAsp').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    if (E.aspect !== 'free') cropToAspect(E, E.aspect); drawCropRect();
+  };
+  const layer = $('#cropLayer'); let drag = null;
+  layer.addEventListener('pointerdown', (e) => {
+    const E = S.cropEdit; if (!E) return;
+    e.preventDefault();
+    const h = e.target.dataset?.h, inRect = e.target.closest('#cropRect');
+    if (!h && !inRect) return;
+    try { layer.setPointerCapture(e.pointerId); } catch {}
+    drag = { id: e.pointerId, h: h || 'move', x: e.clientX, y: e.clientY, r0: E.r.slice() };
+  });
+  layer.addEventListener('pointermove', (e) => {
+    const E = S.cropEdit; if (!E || !drag || e.pointerId !== drag.id) return;
+    e.preventDefault();
+    const rc = layer.getBoundingClientRect(), dx = (e.clientX - drag.x) / rc.width, dy = (e.clientY - drag.y) / rc.height;
+    let [x0, y0, x1, y1] = drag.r0; const MIN = 0.08;
+    if (drag.h === 'move') {
+      const w = x1 - x0, h = y1 - y0; x0 = clamp(x0 + dx, 0, 1 - w); y0 = clamp(y0 + dy, 0, 1 - h); x1 = x0 + w; y1 = y0 + h;
+    } else {
+      // the opposite corner stays put
+      const L = drag.h.includes('w'), T = drag.h.includes('n');
+      let ax = L ? x1 : x0, ay = T ? y1 : y0, px = clamp((L ? x0 : x1) + dx, 0, 1), py = clamp((T ? y0 : y1) + dy, 0, 1);
+      let w = Math.max(MIN, Math.abs(px - ax)), h = Math.max(MIN, Math.abs(py - ay));
+      const A = CROP_ASPECTS[E.aspect];
+      if (A) {
+        const ar = rc.width / rc.height; // normalized -> pixels
+        if (w * ar / h > A) w = h * A / ar; else h = w * ar / A;
+        const wMax = L ? ax : 1 - ax, hMax = T ? ay : 1 - ay; // keep inside the frame, shape locked
+        const s = Math.min(1, wMax / w, hMax / h); w *= s; h *= s;
+      } else { w = Math.min(w, L ? ax : 1 - ax); h = Math.min(h, T ? ay : 1 - ay); }
+      x0 = L ? ax - w : ax; x1 = x0 + w; y0 = T ? ay - h : ay; y1 = y0 + h;
+    }
+    E.r = [x0, y0, x1, y1]; drawCropRect();
+  });
+  const up = (e) => { if (drag && e.pointerId === drag.id) drag = null; };
+  layer.addEventListener('pointerup', up); layer.addEventListener('pointercancel', up);
+  addEventListener('resize', () => { if (S.cropEdit) drawCropRect(); });
 }
 function bindFocus() {
   $('#ciFocus').onclick = () => setFocusMode(!S.focusMode);
@@ -1118,17 +1238,20 @@ async function autoEdit(files) {
       if (m.capture == null) m.capture = m.captureMeta || m.blob.lastModified || null;
       let an = S.analysis.get(id);
       const ta = performance.now();
-      if (an && (st.keepFrame !== false || st.hideMan !== 'off') && an.pv !== 3) an = null; // analysed without (current) people detection: redo
+      if (an && (st.keepFrame !== false || st.hideMan !== 'off') && an.pv !== 4) an = null; // analysed without (current) people detection: redo
       if (!an) {
         let pose = null;
         if (st.keepFrame !== false || st.hideMan !== 'off') { auProg(0.9 * done / totalDur, 'Loading the people detector…'); pose = await loadPose(); }
         an = await analyzeRange(m.url, 0, m.duration, { signal: ac.signal, pose,
           onTick: (f) => auProg(0.9 * (done + f * m.duration) / totalDur, `Analyzing clip ${i + 1} of ${mids.length}…`) });
         console.info(`[auto] analysed ${m.name} (${m.duration.toFixed(1)} s) in ${Math.round(performance.now() - ta)} ms via ${an.mode}, ${an.samples.length} samples`);
-        an.posed = !!pose; an.pv = 3; an.pov = classifyPov(an.samples);
+        an.posed = !!pose; an.pv = 4; an.pov = classifyPov(an.samples);
         console.info(`[framing] ${m.name}: ${an.pov.kind} (two heads ${an.pov.two}, partial ${an.pov.partial}, shake ${an.pov.shake})`);
         S.analysis.set(id, an);
       }
+      // baked-in black bars (e.g. padding from cropping / re-framing in Photos): trimmed by a default crop for this video
+      // unless the crop was set by hand (an explicit "whole frame" is kept as [0, 0, 1, 1])
+      if (an.bars && !S.proj.crops?.[id]) { S.proj.crops = { ...(S.proj.crops || {}), [id]: an.bars.slice() }; console.info(`[crop] ${m.name}: baked black bars trimmed`, an.bars); }
       done += m.duration;
       items.push({ mediaId: id, name: m.name.replace(/\.\w+$/, ''), in: 0, out: r2(m.duration), dur: m.duration, w: m.w, h: m.h,
         order: m.order ?? i, capture: m.capture, samples: an.samples, step: an.step });
@@ -1144,7 +1267,11 @@ async function autoEdit(files) {
     const inGroup = new Set(groups.flatMap(g => g.members.map(m => m.mediaId)));
     const plan = planEdit(items, { ...st, skip: inGroup });
     const enh = {};
-    for (const it of items) enh[it.mediaId] = enhanceFor(it.samples, st);
+    for (const it of items) {
+      const m = S.media.get(it.mediaId);
+      if (m && m.hdr === undefined && m.blob) m.hdr = await videoColor(m.blob);
+      enh[it.mediaId] = enhanceFor(it.samples, { ...st, hdr: m?.hdr && m.hdr !== 'wide' ? m.hdr : null });
+    }
     const xf = parseXf(groups.length ? st.mcXfade : st.xfade);
     const itemMap = new Map(items.map(it => [it.mediaId, it]));
     const units = plan.keep.map(s => ({ shots: [s], cap: (s.capture ?? Infinity) + s.in * 1000, order: s.order, in: s.in, score: s.score }));
@@ -1190,6 +1317,11 @@ async function autoEdit(files) {
       const e = (st.color || st.shadows || st.denoise || st.sharpen || st.stabilize) ? { ...enh[s.mediaId], stab: !!(st.stabilize && shake > 0.015) } : null;
       const o = { id: uid(), mediaId: s.mediaId, name: `${s.name} · ${k + 1}${s.ext === 'slow' ? ' · slow-mo' : s.ext === 'boom' ? ' · boomerang' : s.ext === 'replay' ? ' · replay' : s.ext === 'angles' ? ' · every angle' : ''}`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
         enh: e, cam: st.camera || s.hide ? s.cam : null, score: s.score, capture: s.capture, order: s.order, thumb: s.thumb || '' };
+      if (S.proj.crops?.[s.mediaId]) o.crop = S.proj.crops[s.mediaId].slice();
+      { // where the people are (median subject centre): the "no black bars" fill keeps them in
+        const ss = (s.samples || []).filter(x => Number.isFinite(x.cx) && Number.isFinite(x.cy)), md = (k) => ss.map(x => x[k]).sort((a, b) => a - b)[ss.length >> 1];
+        if (ss.length >= 3) o.fc = [+md('cx').toFixed(3), +md('cy').toFixed(3)];
+      }
       if (s.speed && s.speed < 1) o.speed = s.speed;
       if (s.boom) o.boom = true;
       if (s.hide) o.hide = s.hide;
@@ -1380,7 +1512,7 @@ function markMomentAllAngles() {
     c.out = cut; c.mc = { ...c.mc, g1: +T.toFixed(4) };
     const ins = seq.map(s => ({ id: uid(), mediaId: s.mediaId, name: `🔁${camLetter(s.mc.cam)} ${s.name} · every angle`, in: s.in, out: s.out, dur: s.dur, w: s.w, h: s.h, muted: false,
       enh: S.proj.autoEnh?.[s.mediaId] ? { ...S.proj.autoEnh[s.mediaId], stab: false } : (c.enh ? { ...c.enh } : null), cam: null, score: 0.6, capture: c.capture, order: c.order, thumb: '',
-      ...(s.speed ? { speed: s.speed } : {}), ext: 'angles', mc: { ...s.mc }, ...(s.audioFrom.mediaId !== s.mediaId ? { audioFrom: { ...s.audioFrom } } : {}) }));
+      ...(s.speed ? { speed: s.speed } : {}), ext: 'angles', mc: { ...s.mc }, ...(S.proj.crops?.[s.mediaId] ? { crop: S.proj.crops[s.mediaId].slice() } : {}), ...(s.audioFrom.mediaId !== s.mediaId ? { audioFrom: { ...s.audioFrom } } : {}) }));
     const cs = clips(); const i = cs.indexOf(c);
     const head = c.out - c.in > 0.05 ? 1 : 0; if (!head) cs.splice(i, 1);
     cs.splice(i + head, 0, ...ins, tail); S.sel = ins[0].id;
@@ -1453,7 +1585,7 @@ function restoreCut(id) {
   mutate(() => {
     const cs = clips();
     const clip = { id: uid(), mediaId: cut.mediaId, name: `${cut.name} · restored`, in: cut.in, out: cut.out, dur: cut.dur, w: cut.w, h: cut.h, muted: false,
-      enh: S.proj.autoEnh?.[cut.mediaId] ? { ...S.proj.autoEnh[cut.mediaId] } : null, cam: null, capture: cut.capture, order: cut.order, thumb: cut.thumb || '' };
+      enh: S.proj.autoEnh?.[cut.mediaId] ? { ...S.proj.autoEnh[cut.mediaId] } : null, cam: null, capture: cut.capture, order: cut.order, thumb: cut.thumb || '', ...(S.proj.crops?.[cut.mediaId] ? { crop: S.proj.crops[cut.mediaId].slice() } : {}) };
     // put it back next to its neighbours from the same video (by source time)
     let at = -1;
     cs.forEach((c, i) => { if (c.mediaId === cut.mediaId && c.in <= cut.in) at = i; });
@@ -1569,7 +1701,7 @@ function bind() {
   if (localStorage.getItem('vc.age18')) $('#ageGate').classList.remove('show');
 
   $$('.tabs button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
-  bindAuto(); bindFocus();
+  bindAuto(); bindFocus(); bindCrop();
   const fi = $('#fileInput');
   $('#btnImport').onclick = $('#btnImport2').onclick = () => fi.click();
   fi.onchange = () => { importFiles(fi.files); fi.value = ''; };

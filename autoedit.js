@@ -188,6 +188,26 @@ async function setSrc(v, url) {
   await p;
 }
 
+/** baked-in black bars from per-row / per-column maxima -> [x0, y0, x1, y1] of the picture inside, or null */
+export function bakedBars(rowMax, colMax, AW, AH, TH = 16) {
+  let t = 0, b = AH, l = 0, r = AW;
+  while (t < AH && rowMax[t] < TH) t++;
+  while (b > t && rowMax[b - 1] < TH) b--;
+  while (l < AW && colMax[l] < TH) l++;
+  while (r > l && colMax[r - 1] < TH) r--;
+  // real padding is centred (letterbox / pillarbox) and ends in a sharp edge; dark footage fades out gradually
+  const sharp = (arr, i, dir) => Math.max(arr[i] || 0, arr[i + dir] || 0, arr[i + 2 * dir] || 0) >= 48;
+  const symm = (a, z, N) => Math.abs(a - z) <= Math.max(2, 0.03 * N);
+  if (!(t + (AH - b) > 0 && symm(t, AH - b, AH) && sharp(rowMax, t, 1) && sharp(rowMax, b - 1, -1))) { t = 0; b = AH; }
+  if (!(l + (AW - r) > 0 && symm(l, AW - r, AW) && sharp(colMax, l, 1) && sharp(colMax, r - 1, -1))) { l = 0; r = AW; }
+  // a row / column of mixed bar + picture after scaling: step one more in on every side that has a bar
+  if (t > 0) t++; if (b < AH) b--; if (l > 0) l++; if (r < AW) r--;
+  const fy = (t + AH - b) / AH, fx = (l + AW - r) / AW;
+  if (fy < 0.04 && fx < 0.04) return null;            // no real bars
+  if ((b - t) / AH < 0.3 || (r - l) / AW < 0.3) return null; // mostly black: a dark video, not padding
+  const v = (x) => +x.toFixed(4);
+  return [v(fx < 0.04 ? 0 : l / AW), v(fy < 0.04 ? 0 : t / AH), v(fx < 0.04 ? 1 : r / AW), v(fy < 0.04 ? 1 : b / AH)];
+}
 /**
  * Sample a media range at ~2 frames/s on 120-px frames.
  * Fast path: play the (muted) video at high speed and grab frames with requestVideoFrameCallback
@@ -214,8 +234,12 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
   const thumb = () => { tctx.drawImage(cv, 0, 0, tc.width, tc.height); return tc.toDataURL('image/jpeg', 0.55); };
   const out = [];
   let prevG = null, prevSig = null, prevHist = null;
+  // brightest value seen per row / column over the whole clip: rows / columns that stay black are baked-in bars
+  // (padding added when a video was cropped / re-framed in another app)
+  const rowMax = new Uint8Array(AH), colMax = new Uint8Array(AW);
   const measure = (d1, d2, dt, t, th, ppl = null) => {
     const g1 = toGray(d1, n), g2 = d2 === d1 ? g1 : toGray(d2, n);
+    for (let y = 0, j = 0; y < AH; y++) for (let x = 0; x < AW; x++, j++) { const g = g1[j]; if (g > rowMax[y]) rowMax[y] = g; if (g > colMax[x]) colMax[x] = g; }
     let luma = 0, sat = 0, dark = 0, bright = 0, sd = 0, shad = 0;
     for (let i = 0, j = 0; j < n; i += 4, j++) {
       luma += g1[j]; if (g1[j] < 24) dark++; if (g1[j] < 51) shad++; if (g1[j] > 238) bright++;
@@ -315,7 +339,16 @@ export async function analyzeRange(url, t0, t1, { onTick, signal, maxSamples = 2
   }
   assignTargets(out);
   for (const s of out) { const f = framingScore(s); if (f != null) s.fq = f; }
-  return { samples: out, step, mode, pose: !!pose };
+  const bars = out.length >= 3 ? bakedBars(rowMax, colMax, AW, AH) : null;
+  if (bars) { // the darkness stats must describe the picture, not the black padding around it
+    const a = (bars[2] - bars[0]) * (bars[3] - bars[1]), bl = 0.03;
+    for (const s of out) {
+      s.luma = clamp((s.luma - (1 - a) * bl) / a, 0, 1);
+      s.dark = clamp((s.dark - (1 - a)) / a, 0, 1); s.shad = clamp((s.shad - (1 - a)) / a, 0, 1);
+      s.sd = clamp(s.sd / Math.sqrt(a), 0, 1);
+    }
+  }
+  return { samples: out, step, mode, pose: !!pose, bars };
 }
 
 const STRICT = {
@@ -470,6 +503,9 @@ export function enhanceFor(samples, settings) {
   const avg = (k) => ss.reduce((a, s) => a + s[k], 0) / Math.max(1, ss.length);
   const L = avg('luma'), SD = avg('sd'), SAT = avg('sat');
   const e = { b: 0, c: 1, s: 1, dn: 0, sh: 0, stab: false };
+  // HDR / wide-gamut sources (iPhone HDR video and its crops): the analysed brightness is not reliable (the browser
+  // maps HLG / PQ to SDR its own way), and lifting it again washes it out -> no automatic colour / shadow changes
+  if (settings.hdr) { e.hdr = settings.hdr; settings = { ...settings, color: false, shadows: false }; }
   if (settings.color) {
     e.b = +clamp((0.47 - L) * 0.6, -0.2, 0.3).toFixed(2);
     e.c = +clamp(0.21 / Math.max(0.05, SD), 0.95, 1.3).toFixed(2);
@@ -480,14 +516,17 @@ export function enhanceFor(samples, settings) {
   if (settings.shadows !== false) {
     // shadow fraction = share of pixels darker than 20 % luma (older cached analyses: estimated from very-dark share)
     const F = ss.reduce((a, s) => a + (s.shad ?? clamp(s.dark * 1.6 + (0.35 - s.luma), 0, 1)), 0) / Math.max(1, ss.length);
-    const k = clamp((F - 0.2) / 0.5, 0, 0.85) * (L < 0.6 ? 1 : 0.6);
+    // gentle by default (v14): a strong automatic lift on dark footage flattened and tinted it (washed-out pink)
+    const k = clamp((F - 0.2) / 0.5, 0, 0.5) * (L < 0.6 ? 1 : 0.6);
     e.shadowFrac = +F.toFixed(3);
     if (k >= 0.08) {
       e.shadow = +k.toFixed(2);
       // the lift does the brightening in the darks: keep the global boost small so highlights don't clip,
       // and soften extra contrast (it would push the lifted shadows back down)
-      e.b = Math.min(e.b, 0.12);
-      if (e.c > 1) e.c = +(1 + (e.c - 1) * (1 - 0.6 * e.shadow)).toFixed(2);
+      // never stack a second brightening / punchier contrast / extra saturation on top of the lift
+      e.b = Math.min(e.b, 0.03);
+      e.c = Math.min(e.c, 1.05);
+      e.s = Math.min(e.s, 1.05);
     }
   }
   return e;

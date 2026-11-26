@@ -42,6 +42,13 @@
   </div>
 </header>
 
+<div id="cropBar" class="cropbar" hidden>
+  <div class="cropasp" id="cropAsp">
+    <button data-a="free" class="on">Free</button><button data-a="9:16">9:16</button><button data-a="4:5">4:5</button><button data-a="1:1">1:1</button><button data-a="16:9">16:9</button>
+  </div>
+  <label class="chk"><input type="checkbox" id="cropAll" checked> All shots from this video</label>
+  <div class="cropbtns"><button id="cropReset">Reset</button><button id="cropCancel">Cancel</button><button id="cropDone" class="primary">✓ Done</button></div>
+</div>
 <main class="layout">
   <section class="viewer">
     <div id="stageWrap" class="stagewrap">
@@ -53,6 +60,9 @@
         <div id="focusDot" class="focusdot" hidden></div>
         <div id="capLayer" class="caplayer"></div>
         <canvas id="protBox" class="protbox" hidden></canvas>
+        <div id="cropLayer" class="croplayer" hidden>
+          <div id="cropRect" class="croprect"><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i><span class="cropgrid"></span></div>
+        </div>
         <div id="dropHint" class="drophint">
           <div>Drop videos here<br><small>mp4 · mov · webm — stays on this device</small></div>
           <button id="btnAuto2" class="primary">⚡ Auto Edit videos</button>
@@ -208,6 +218,15 @@
           </select></label>
           <label class="chk"><input type="checkbox" id="ciBoom"> 🔁 Boomerang (forward, then back)</label>
         </div>
+        <div class="btnrow">
+          <button id="ciCrop">✂️ Crop</button>
+          <button id="ciCropReset">Reset crop</button>
+        </div>
+        <label>Black bars (all clips)<select id="pjFill">
+          <option value="auto">Auto: fill the frame when little is lost</option>
+          <option value="always">Always fill the frame (no black bars)</option>
+          <option value="off">Show the whole video (bars OK)</option>
+        </select></label>
         <div class="btnrow">
           <button id="ciFocus">🎯 Set focus</button>
           <button id="ciFocusClr">Clear focus</button>

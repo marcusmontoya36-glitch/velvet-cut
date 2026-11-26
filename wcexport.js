@@ -6,7 +6,7 @@
 // Exports with no visual changes are stream-copied without any re-encode (remux).
 import { createFile, DataStream, Endianness, MP4BoxBuffer } from './vendor/webcodecs/mp4box.js';
 import { Muxer, ArrayBufferTarget } from './vendor/webcodecs/mp4-muxer.js';
-import { shadowAmt, outputSize, xfadeDurations, clipDur, fwdDur, clipSpeed, srcAt, camP, clipColor, drawCaption, hasWarp, hasFish, programAudio } from './render.js';
+import { shadowAmt, outputSize, xfadeDurations, clipDur, fwdDur, clipSpeed, srcAt, camP, clipColor, drawCaption, hasWarp, hasFish, programAudio, viewCrop } from './render.js';
 import { createFx } from './fx.js';
 
 const FPS = 30, SR = 48000;
@@ -69,7 +69,19 @@ async function doDemux(blob) {
   const a = m[0] / 65536, b = m[1] / 65536;
   const rot = Math.abs(a) > 0.5 ? (a < 0 ? 2 : 0) : (b > 0 ? 1 : 3);
   const cw = vt.video?.width || entry.width, ch = vt.video?.height || entry.height;
-  const res = { codec: vt.codec, description, codedWidth: cw, codedHeight: ch, rot, w: rot % 2 ? ch : cw, h: rot % 2 ? cw : ch,
+  // HDR / wide colour (iPhone HDR = HEVC HLG + Dolby Vision, BT.2020): colr nclx box or Dolby Vision config boxes
+  const colr = entry.colr || (entry.boxes || []).find(b => b.type === 'colr');
+  const kids = (entry.boxes || []).map(b => b.type);
+  let tc = colr?.transfer_characteristics, cp = colr?.colour_primaries;
+  if (colr && tc == null && colr.start != null) { // QuickTime 'nclc' (what iPhones write) isn't parsed by mp4box: read the raw box
+    try {
+      const dv = new DataView(await blob.slice(colr.start, colr.start + 18).arrayBuffer());
+      if (dv.byteLength >= 16 && dv.getUint32(4) === 0x636f6c72) { cp = dv.getUint16(12); tc = dv.getUint16(14); }
+    } catch {}
+  }
+  const hdr = kids.includes('dvcC') || kids.includes('dvvC') || /^(dvh1|dvhe)/.test(vt.codec) ? 'dv' : tc === 18 ? 'hlg' : tc === 16 ? 'pq'
+    : cp === 9 ? 'wide' : (tc == null && /^(hvc1|hev1)\.2\./.test(vt.codec)) ? 'hdr10' /* 10-bit HEVC without colour tags: iPhone HDR */ : null;
+  const res = { hdr, codec: vt.codec, description, codedWidth: cw, codedHeight: ch, rot, w: rot % 2 ? ch : cw, h: rot % 2 ? cw : ch,
     fps: vs.length > 1 ? (vs.length - 1) / Math.max(0.001, Math.max(...vs.map(s => s.cts))) : 30, samples: vs, blob, audio: null };
   // iPhone .mov can carry several sound tracks (e.g. a 4-channel spatial 'apac' track next to stereo AAC) plus
   // metadata ('mebx') and timecode tracks: use the AAC one, keep a list for diagnostics
@@ -312,6 +324,8 @@ function needsNoRender(proj, opts) {
   if ((p.b || 0) !== 0 || (p.c ?? 1) !== 1 || (p.s ?? 1) !== 1 || p.w) return false;
   if (opts.burnCaptions && (proj.captions || []).some(c => c.text)) return false;
   if (proj.clips.length > 1 && (+proj.xfade || 0) > 0) return false;
+  const [OW, OH] = outputSize(proj.clips, 'src');
+  if (proj.clips.some(c => viewCrop(c, OW, OH, proj.fill))) return false; // cropped / filled clips must be re-rendered
   return proj.clips.every(c => !c.enh && !shadowAmt(c) && !c.boom && !c.audioFrom && clipSpeed(c) >= 0.999 && !c.muted && (!c.cam || (c.cam.z0 <= 1.001 && c.cam.z1 <= 1.001 && !c.cam.flip && !hasWarp(c.cam) && !hasFish(c.cam))));
 }
 export async function canRemux(proj, media, opts) {
@@ -409,7 +423,7 @@ export function createWcExport(proj, media, opts = {}) {
     };
     const drawClip = async (i, l, alpha, gain, layer) => {
       const c = clips[i], dm = dms.get(c.mediaId), sp = clipSpeed(c), F = fwdDur(c);
-      const look = { alpha, gain, layer, rot: dm.rot, color: clipColor(proj, c), warm, sharp: c.enh?.sh ? 0.35 : 0, shadow: shadowAmt(c) };
+      const look = { alpha, gain, layer, rot: dm.rot, color: clipColor(proj, c), warm, sharp: c.enh?.sh ? 0.35 : 0, shadow: shadowAmt(c), crop: viewCrop(c, W, H, proj.fill) };
       const p = camP(c, l), ts = srcAt(c, l);
       if (c.boom && l > F + 0.5 / FPS) { // reverse half: frames kept from the forward half
         const arr = booms.get(i) || []; if (!arr.length) return;
@@ -567,3 +581,6 @@ function createYuv(fx, W, H) {
     },
   };
 }
+
+/** 'hlg' | 'pq' | 'dv' | 'wide' (BT.2020 SDR) | null — HDR / wide-gamut source (e.g. an iPhone HDR video or its crop) */
+export async function videoColor(blob) { try { return (await demux(blob)).hdr || null; } catch { return null; } }
